@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<gpx version="1.1" creator="Xcode">
+    <trk>
+        <name>Taoyuan Fast Delivery Route</name>
+        <trkseg>
+            <!-- 第一點：桃園火車站前（靜止點 S） -->
+            <trkpt lat="24.9892" lon="121.3135">
+                <time>2026-09-10T10:00:00Z</time>
+            </trkpt>
+            
+            <!-- 第二點：往中正路移動（5 秒後） -->
+            <trkpt lat="24.9915" lon="121.3120">
+                <time>2026-09-10T10:00:05Z</time>
+            </trkpt>
+            
+            <!-- 第三點：到達藝文特區附近（離店 > 200m，10 秒後） -->
+            <trkpt lat="24.9985" lon="121.3045">
+                <time>2026-09-10T10:00:15Z</time>
+            </trkpt>
+            
+            <!-- 第四點：桃園市立圖書館總館（10 秒後） -->
+            <trkpt lat="25.0012" lon="121.3018">
+                <time>2026-09-10T10:00:25Z</time>
+            </trkpt>
+        </trkseg>
+    </trk>
+</gpx>

@@ -1,0 +1,857 @@
+package com.example.UberDeliveryTracker.viewmodel
+
+import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.example.UberDeliveryTracker.floating.FloatingTrackerService
+import com.example.UberDeliveryTracker.location.GPSLocationManager
+import com.example.UberDeliveryTracker.model.DailyReport
+import com.example.UberDeliveryTracker.model.DeliveryBatch
+import com.example.UberDeliveryTracker.model.DeliveryOrder
+import com.example.UberDeliveryTracker.model.WageSettings
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val prefs: SharedPreferences =
+        application.getSharedPreferences("uber_delivery_tracker_prefs", Context.MODE_PRIVATE)
+    private val json = Json { ignoreUnknownKeys = true }
+    private val lbm = LocalBroadcastManager.getInstance(application)
+
+    private val KEY_ACTIVE_ORDERS = "SavedActiveOrdersData"
+    private val KEY_BATCH_START_TIME = "SavedBatchStartTime"
+    private val KEY_HOURLY_RATE = "SavedHourlyRate"
+    private val KEY_DAILY_REPORTS = "SavedDailyReportsData"
+
+    // 接收懸浮窗廣播：取餐 / 送達
+    private val floatingActionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                FloatingTrackerService.ACTION_SCREENSHOT -> {
+                    handleScreenshotFromFloating(
+                        noteText = intent?.getStringExtra(FloatingTrackerService.EXTRA_NOTE_TEXT) ?: "",
+                        orderCode = intent?.getStringExtra(FloatingTrackerService.EXTRA_ORDER_CODE) ?: "",
+                        isOffer = intent?.getBooleanExtra(FloatingTrackerService.EXTRA_IS_OFFER, false) ?: false,
+                        isCash = intent?.getBooleanExtra(FloatingTrackerService.EXTRA_IS_CASH, false) ?: false,
+                        offerSummary = intent?.getStringExtra(FloatingTrackerService.EXTRA_OFFER_SUMMARY) ?: ""
+                    )
+                }
+                FloatingTrackerService.ACTION_PICKUP_ORDER -> {
+                    intent?.getStringExtra(FloatingTrackerService.EXTRA_ORDER_ID)?.let { markPickupComplete(it) }
+                }
+                FloatingTrackerService.ACTION_DELIVER_ORDER -> {
+                    intent?.getStringExtra(FloatingTrackerService.EXTRA_ORDER_ID)?.let { completeOrder(it) }
+                }
+                FloatingTrackerService.ACTION_PICKUP -> {
+                    // 對最早的未取餐、未完成訂單執行取餐
+                    val target = _activeOrders.value
+                        .filter { !it.isCompleted && !it.isDiscarded && it.pickupTimeMillis == null }
+                        .minByOrNull { it.startTimeMillis }
+                    target?.let { markPickupComplete(it.id) }
+                }
+                FloatingTrackerService.ACTION_DELIVER -> {
+                    // 對最早的已取餐但未完成訂單執行送達
+                    val target = _activeOrders.value
+                        .filter { !it.isCompleted && !it.isDiscarded }
+                        .minByOrNull { it.startTimeMillis }
+                    target?.let { completeOrder(it.id) }
+                }
+            }
+        }
+    }
+
+    // 進行中的訂單清單
+    private val _activeOrders = MutableStateFlow<List<DeliveryOrder>>(emptyList())
+    val activeOrders: StateFlow<List<DeliveryOrder>> = _activeOrders.asStateFlow()
+
+    // 歷史每日報表集合 (Key: "yyyy-MM-dd")
+    private val _dailyReports = MutableStateFlow<Map<String, DailyReport>>(emptyMap())
+    val dailyReports: StateFlow<Map<String, DailyReport>> = _dailyReports.asStateFlow()
+
+    // 歷史報表目前選取的日期 (預設今天)
+    private val _selectedReportDate = MutableStateFlow(getTodayDateKey())
+    val selectedReportDate: StateFlow<String> = _selectedReportDate.asStateFlow()
+
+    // 計時器秒數
+    private val _elapsedSeconds = MutableStateFlow(0L)
+    val elapsedSeconds: StateFlow<Long> = _elapsedSeconds.asStateFlow()
+
+    // 是否跑單中
+    private val _isDelivering = MutableStateFlow(false)
+    val isDelivering: StateFlow<Boolean> = _isDelivering.asStateFlow()
+
+    // 時薪設定 (預設 200.0)
+    private val _hourlyRate = MutableStateFlow(200.0)
+    val hourlyRate: StateFlow<Double> = _hourlyRate.asStateFlow()
+
+    // 即時預估總收入 (工資 + 小費 + 自訂工資)
+    private val _totalEarnings = MutableStateFlow(0.0)
+    val totalEarnings: StateFlow<Double> = _totalEarnings.asStateFlow()
+
+    // 即時換算時薪 (每小時效益)
+    private val _currentHourlyWage = MutableStateFlow(0.0)
+    val currentHourlyWage: StateFlow<Double> = _currentHourlyWage.asStateFlow()
+
+    // 批次開始時間戳
+    private var batchStartTimeMillis: Long = 0L
+    private var timerJob: Job? = null
+
+    // ───────── 一班（上班到下班）的時薪 ─────────
+    data class ShiftSnapshot(
+        val startMillis: Long,
+        val endMillis: Long,
+        val isClosed: Boolean,
+        val closedByUser: Boolean,
+        val wage: Double,
+        val orderCount: Int
+    ) {
+        val hours: Double get() = maxOf(0L, endMillis - startMillis) / 3600000.0
+        val hourly: Double? get() = if (hours > 0) wage / hours else null
+    }
+
+    private val _shift = MutableStateFlow<ShiftSnapshot?>(null)
+    val shift: StateFlow<ShiftSnapshot?> = _shift.asStateFlow()
+
+    private val KEY_SHIFT_OFF = "ShiftOffTimestamp"
+    private val KEY_SHIFT_OFF_PREV = "ShiftOffPrevious"
+    private var shiftOffMillis: Long = 0L
+    private var shiftOffPreviousMillis: Long = 0L
+    private var shiftJob: Job? = null
+
+    init {
+        loadSavedData()
+        // 監聽懸浮窗動作廣播
+        val filter = IntentFilter().apply {
+            addAction(FloatingTrackerService.ACTION_PICKUP)
+            addAction(FloatingTrackerService.ACTION_DELIVER)
+            addAction(FloatingTrackerService.ACTION_PICKUP_ORDER)
+            addAction(FloatingTrackerService.ACTION_DELIVER_ORDER)
+            addAction(FloatingTrackerService.ACTION_SCREENSHOT)
+        }
+        lbm.registerReceiver(floatingActionReceiver, filter)
+        loadShiftOff()
+        startShiftTicker()
+    }
+
+    private fun loadSavedData() {
+        val savedRate = prefs.getFloat(KEY_HOURLY_RATE, 200.0f).toDouble()
+        _hourlyRate.value = savedRate
+
+        val ordersJson = prefs.getString(KEY_ACTIVE_ORDERS, null)
+        if (!ordersJson.isNullOrEmpty()) {
+            try {
+                val orders = json.decodeFromString<List<DeliveryOrder>>(ordersJson)
+                _activeOrders.value = orders
+                batchStartTimeMillis = prefs.getLong(KEY_BATCH_START_TIME, 0L)
+                val hasUnfinished = orders.any { !it.isCompleted && !it.isDiscarded }
+                if (hasUnfinished && batchStartTimeMillis > 0L) {
+                    _isDelivering.value = true
+                    startTimer()
+                } else {
+                    recalculateStats()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        val reportsJson = prefs.getString(KEY_DAILY_REPORTS, null)
+        if (!reportsJson.isNullOrEmpty()) {
+            try {
+                val reports = json.decodeFromString<Map<String, DailyReport>>(reportsJson)
+                _dailyReports.value = reports
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    private fun saveData() {
+        try {
+            val ordersJson = json.encodeToString(_activeOrders.value)
+            val reportsJson = json.encodeToString(_dailyReports.value)
+            prefs.edit()
+                .putString(KEY_ACTIVE_ORDERS, ordersJson)
+                .putString(KEY_DAILY_REPORTS, reportsJson)
+                .putLong(KEY_BATCH_START_TIME, batchStartTimeMillis)
+                .putFloat(KEY_HOURLY_RATE, _hourlyRate.value.toFloat())
+                .apply()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun startTimer() {
+        timerJob?.cancel()
+        timerJob = viewModelScope.launch {
+            while (isActive) {
+                if (batchStartTimeMillis > 0L) {
+                    val now = System.currentTimeMillis()
+                    _elapsedSeconds.value = maxOf(0L, (now - batchStartTimeMillis) / 1000L)
+                    recalculateStats()
+                    // 每秒推送即時數據給懸浮窗
+                    pushDisplayUpdateToFloating()
+                }
+                delay(1000L)
+            }
+        }
+    }
+
+    /** 推送即時時薪、計時秒數、進行中最新單號給懸浮窗 */
+    private fun pushDisplayUpdateToFloating() {
+        val activeOrderNumber = _activeOrders.value
+            .filter { !it.isCompleted && !it.isDiscarded }
+            .minByOrNull { it.startTimeMillis }
+            ?.orderNumber ?: 0
+        val intent = Intent(FloatingTrackerService.ACTION_UPDATE_DISPLAY).apply {
+            putExtra(FloatingTrackerService.EXTRA_HOURLY_WAGE, _currentHourlyWage.value.toInt())
+            putExtra(FloatingTrackerService.EXTRA_ELAPSED_SECONDS, _elapsedSeconds.value)
+            putExtra(FloatingTrackerService.EXTRA_ACTIVE_ORDER_NUMBER, activeOrderNumber)
+        }
+        pushOrderListToFloating()
+        lbm.sendBroadcast(intent)
+    }
+
+    // ───────── 一班時薪：計算與下班 ─────────
+
+    private fun loadShiftOff() {
+        shiftOffMillis = prefs.getLong(KEY_SHIFT_OFF, 0L)
+        shiftOffPreviousMillis = prefs.getLong(KEY_SHIFT_OFF_PREV, 0L)
+    }
+
+    /** 每秒重算一次這一班的時薪（就算批次碼表停了，這一班還沒下班就繼續算） */
+    private fun startShiftTicker() {
+        shiftJob?.cancel()
+        shiftJob = viewModelScope.launch {
+            while (isActive) {
+                refreshShift()
+                if (timerJob?.isActive != true) pushDisplayUpdateToFloating()
+                delay(1000L)
+            }
+        }
+    }
+
+    private fun dateKeyOf(millis: Long): String =
+        SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(millis))
+
+    /**
+     * 算出「目前這一班」：
+     * 兩單之間空檔超過 60 分鐘，或你按過下班之後才接的單，就算新的一班。
+     */
+    private fun computeShift(now: Long): ShiftSnapshot? {
+        val all = mutableListOf<DeliveryOrder>()
+        for (key in listOf(dateKeyOf(now - 24L * 3600_000L), dateKeyOf(now))) {
+            val report = _dailyReports.value[key] ?: continue
+            for (batch in report.batches) {
+                all.addAll(batch.orders.filter {
+                    !it.isDiscarded && !it.isManualEntry && it.endTimeMillis != null
+                })
+            }
+        }
+        all.addAll(_activeOrders.value.filter { !it.isDiscarded })
+
+        // 進行中的單，結束時間至少算「接單後 11 分鐘」
+        fun endOf(o: DeliveryOrder): Long =
+            o.endTimeMillis ?: maxOf(now, o.startTimeMillis + 11 * 60_000L)
+
+        val sorted = all.sortedBy { it.startTimeMillis }
+        val first = sorted.firstOrNull() ?: return null
+
+        var session = mutableListOf(first)
+        var sessionStart = first.startTimeMillis
+        var sessionEnd = endOf(first)
+
+        for (order in sorted.drop(1)) {
+            val gapBreak = order.startTimeMillis - sessionEnd > 3_600_000L
+            val offBreak = shiftOffMillis > 0L &&
+                    shiftOffMillis >= sessionStart &&
+                    order.startTimeMillis > shiftOffMillis
+            if (gapBreak || offBreak) {
+                session = mutableListOf(order)
+                sessionStart = order.startTimeMillis
+                sessionEnd = endOf(order)
+            } else {
+                session.add(order)
+                sessionEnd = maxOf(sessionEnd, endOf(order))
+            }
+        }
+
+        val wage = session.sumOf { it.rawOperationWage }
+
+        // 1) 你按了下班
+        if (shiftOffMillis > 0L && shiftOffMillis >= sessionStart) {
+            return ShiftSnapshot(
+                sessionStart, maxOf(shiftOffMillis, sessionEnd),
+                isClosed = true, closedByUser = true,
+                wage = wage, orderCount = session.size
+            )
+        }
+        // 2) 忘了按下班：最後一張單結束超過 60 分鐘，自動下班
+        if (now - sessionEnd > 3_600_000L) {
+            return ShiftSnapshot(
+                sessionStart, sessionEnd,
+                isClosed = true, closedByUser = false,
+                wage = wage, orderCount = session.size
+            )
+        }
+        // 3) 這一班進行中
+        return ShiftSnapshot(
+            sessionStart, maxOf(now, sessionEnd),
+            isClosed = false, closedByUser = false,
+            wage = wage, orderCount = session.size
+        )
+    }
+
+    private fun refreshShift() {
+        val snap = computeShift(System.currentTimeMillis())
+        _shift.value = snap
+        _currentHourlyWage.value = snap?.hourly ?: WageSettings.currentHourly
+    }
+
+    /** 按下班：停止這一班的時薪計算 */
+    fun endShift() {
+        shiftOffPreviousMillis = shiftOffMillis
+        shiftOffMillis = System.currentTimeMillis()
+        prefs.edit()
+            .putLong(KEY_SHIFT_OFF, shiftOffMillis)
+            .putLong(KEY_SHIFT_OFF_PREV, shiftOffPreviousMillis)
+            .apply()
+        refreshShift()
+    }
+
+    val canUndoEndShift: Boolean
+        get() = shiftOffMillis > 0L && System.currentTimeMillis() - shiftOffMillis < 10 * 60_000L
+
+    /** 誤觸下班：10 分鐘內可以取消，繼續計算 */
+    fun undoEndShift() {
+        if (!canUndoEndShift) return
+        shiftOffMillis = shiftOffPreviousMillis
+        shiftOffPreviousMillis = 0L
+        prefs.edit()
+            .putLong(KEY_SHIFT_OFF, shiftOffMillis)
+            .putLong(KEY_SHIFT_OFF_PREV, 0L)
+            .apply()
+        refreshShift()
+    }
+
+    /** 把「進行中的單」整份清單推給懸浮球（球上點一下可以切換顯示哪一張） */
+    private fun pushOrderListToFloating() {
+        val now = System.currentTimeMillis()
+        // 有現金單的排最前面，其他依接單順序
+        val open = _activeOrders.value
+            .filter { !it.isCompleted && !it.isDiscarded }
+            .sortedWith(
+                compareByDescending<DeliveryOrder> { it.isCashOrder || it.cashToCollect.isNotBlank() }
+                    .thenBy { it.startTimeMillis }
+            )
+        val longest = open.maxOfOrNull { (now - it.startTimeMillis) / 1000L } ?: 0L
+
+        lbm.sendBroadcast(Intent(FloatingTrackerService.ACTION_UPDATE_ORDERS).apply {
+            putExtra(FloatingTrackerService.EXTRA_LONGEST_SECONDS, longest)
+            putExtra(FloatingTrackerService.EXTRA_ORDER_IDS, open.map { it.id }.toTypedArray())
+            putExtra(FloatingTrackerService.EXTRA_ORDER_NUMBERS, open.map { it.orderNumber }.toIntArray())
+            putExtra(FloatingTrackerService.EXTRA_ORDER_NOTES, open.map { it.userNote }.toTypedArray())
+            putExtra(FloatingTrackerService.EXTRA_ORDER_WAGES, open.map { it.rawOperationWage }.toDoubleArray())
+            putExtra(
+                FloatingTrackerService.EXTRA_ORDER_CASH,
+                open.map {
+                    when {
+                        it.cashToCollect.isNotBlank() -> it.cashToCollect.trim()
+                        it.isCashOrder -> "?"
+                        else -> ""
+                    }
+                }.toTypedArray()
+            )
+            putExtra(FloatingTrackerService.EXTRA_ORDER_PICKED, open.map { it.pickupTimeMillis != null }.toBooleanArray())
+        })
+    }
+    private fun recalculateStats() {
+        val orders = _activeOrders.value
+        val validOrders = orders.filter { !it.isDiscarded }
+
+        var earned = 0.0
+        for (order in validOrders) {
+            val customWage = order.customWageInput.toDoubleOrNull()
+            val tip = order.tipInput.toDoubleOrNull() ?: 0.0
+            val wage = customWage ?: order.rawOperationWage
+            earned += wage + tip
+        }
+
+        _totalEarnings.value = earned
+
+        refreshShift()
+    }
+
+    /** 沒在跑單就開始計時，已在跑單就加一單，回傳（是不是剛開始、新的那張單） */
+    private fun startOrAddOne(): Pair<Boolean, DeliveryOrder?> {
+        val all = _activeOrders.value
+        val isStart = all.none { !it.isCompleted && !it.isDiscarded }
+        if (isStart) {
+            if (all.isNotEmpty()) finalizeBatch() // 上一趟先收進日報
+            startNewBatch(1)
+            runCatching { GPSLocationManager.instance.startNewDeliverySession() }
+        } else {
+            addAddOnOrders(1)
+        }
+        return Pair(isStart, _activeOrders.value.maxByOrNull { it.orderNumber })
+    }
+
+    /**
+     * 懸浮窗偵測到截圖：
+     * 1) 新來單 → 一定是新的一張單，開始計時 / 加單，現金單會提醒
+     * 2) 單號畫面 → 補給最早那張還沒單號的單
+     * 3) 什麼都沒辨識到 → 還是當作接單，照樣計時
+     */
+    private fun handleScreenshotFromFloating(
+        noteText: String,
+        orderCode: String,
+        isOffer: Boolean = false,
+        isCash: Boolean = false,
+        offerSummary: String = ""
+    ) {
+        val all = _activeOrders.value
+        val open = all.filter { !it.isCompleted && !it.isDiscarded }
+        val oneLine = noteText.replace("\n", " ")
+
+        // 1) 新來單
+        if (isOffer) {
+            val (isStart, newOrder) = startOrAddOne()
+            val head = if (isStart) "⏱ 已開始計時" else "➕ 已加一單"
+            val info = if (offerSummary.isNotEmpty()) "（$offerSummary）" else ""
+            val cashTip = if (isCash) "\n💵 這是現金單！記得跟客人收錢" else ""
+            sendMessageToFloating("$head 訂單 #${newOrder?.orderNumber ?: 1}$info$cashTip")
+            return
+        }
+
+        // 2) 同一個單號已經在某張單裡 → 不重複
+        if (orderCode.isNotEmpty() &&
+            all.any { !it.isDiscarded && it.userNote.contains(orderCode, ignoreCase = true) }
+        ) {
+            sendMessageToFloating("單號 $orderCode 已經在訂單裡了，沒有重複新增")
+            return
+        }
+
+        // 3) 讀到單號，而且有一張單還沒填單號 → 補給最早那一張
+        val emptyOrder = open.sortedBy { it.startTimeMillis }.firstOrNull { it.userNote.trim().isEmpty() }
+        if (noteText.isNotEmpty() && emptyOrder != null) {
+            updateOrderNote(emptyOrder.id, noteText)
+            sendMessageToFloating("✅ 單號填入訂單 #${emptyOrder.orderNumber}：$oneLine")
+            return
+        }
+
+        // 4) 其他情況：這張截圖就是「接了一張新單」
+        val (isStart, newOrder) = startOrAddOne()
+        if (newOrder != null && noteText.isNotEmpty()) updateOrderNote(newOrder.id, noteText)
+
+        val head = if (isStart) "⏱ 已開始計時" else "➕ 已加一單"
+        val tail = if (noteText.isNotEmpty()) "，單號：$oneLine"
+        else "（沒辨識到內容，之後再截有單號的畫面補上）"
+        sendMessageToFloating("$head 訂單 #${newOrder?.orderNumber ?: 1}$tail")
+    }
+    private fun sendMessageToFloating(message: String) {
+        lbm.sendBroadcast(Intent(FloatingTrackerService.ACTION_SHOW_MESSAGE).apply {
+            putExtra(FloatingTrackerService.EXTRA_MESSAGE, message)
+        })
+    }
+
+    fun startNewBatch(initialOrderCount: Int = 1) {
+        runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.startNewDeliverySession() }
+        val now = System.currentTimeMillis()
+        batchStartTimeMillis = now
+
+        val newOrders = (1..initialOrderCount).map { i ->
+            DeliveryOrder(
+                orderNumber = i,
+                startTimeMillis = now
+            )
+        }
+
+        _activeOrders.value = newOrders
+        _isDelivering.value = true
+        _elapsedSeconds.value = 0L
+
+        startTimer()
+        saveData()
+    }
+
+    fun addAddOnOrders(count: Int = 1) {
+        if (count <= 0) return
+        val now = System.currentTimeMillis()
+        val currentMax = _activeOrders.value.maxOfOrNull { it.orderNumber } ?: 0
+        val newOrders = (1..count).map { i ->
+            DeliveryOrder(
+                orderNumber = currentMax + i,
+                startTimeMillis = now
+            )
+        }
+        _activeOrders.value = _activeOrders.value + newOrders
+        recalculateStats()
+        saveData()
+    }
+
+    fun markPickupComplete(orderId: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1 && current[index].pickupTimeMillis == null) {
+            current[index] = current[index].copy(pickupTimeMillis = System.currentTimeMillis())
+            _activeOrders.value = current
+            saveData()
+        }
+    }
+
+    fun completeOrder(orderId: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            val now = System.currentTimeMillis()
+            val target = current[index]
+            current[index] = target.copy(
+                isCompleted = true,
+                endTimeMillis = target.endTimeMillis ?: now
+            )
+            _activeOrders.value = current
+            checkIfAllOrdersDone()
+            recalculateStats()
+            saveData()
+        }
+    }
+
+    fun discardOrder(orderId: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            val target = current[index]
+            current[index] = target.copy(
+                isCompleted = true,
+                isDiscarded = true,
+                endTimeMillis = target.endTimeMillis ?: System.currentTimeMillis()
+            )
+            _activeOrders.value = current
+            checkIfAllOrdersDone()
+            recalculateStats()
+            saveData()
+        }
+    }
+
+    fun restoreOrder(orderId: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            val target = current[index]
+            current[index] = target.copy(
+                isCompleted = false,
+                isDiscarded = false,
+                endTimeMillis = null
+            )
+            _activeOrders.value = current
+            _isDelivering.value = true
+            // 復原後軌跡也要繼續記錄（不清掉原本的點）
+            runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.startTracking() }
+            if (timerJob == null || !timerJob!!.isActive) {
+                startTimer()
+            }
+            recalculateStats()
+            saveData()
+        }
+    }
+
+    fun updateOrderNote(orderId: String, note: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            current[index] = current[index].copy(userNote = note)
+            _activeOrders.value = current
+            saveData()
+        }
+    }
+
+    fun applyScannedNoteToFirstEmptyOrder(scannedText: String): Boolean {
+        val openOrders = _activeOrders.value.filter { !it.isCompleted && !it.isDiscarded }
+        val target = openOrders.firstOrNull { it.userNote.trim().isEmpty() }
+        return if (target != null) {
+            updateOrderNote(target.id, scannedText)
+            true
+        } else {
+            false
+        }
+    }
+
+    fun updateOrderWage(orderId: String, wage: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            current[index] = current[index].copy(customWageInput = wage)
+            _activeOrders.value = current
+            recalculateStats()
+            saveData()
+        }
+    }
+
+    /** 現金單：要跟客人收多少錢（手動輸入）。填了金額就當作現金單 */
+    fun updateOrderCash(orderId: String, cash: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            val o = current[index]
+            current[index] = o.copy(
+                cashToCollect = cash,
+                isCashOrder = cash.isNotBlank() || o.isCashOrder
+            )
+            _activeOrders.value = current
+            saveData()
+        }
+    }
+
+    /** 切換「這是現金單」（金額還不知道時先標記） */
+    fun toggleCashOrder(orderId: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            val o = current[index]
+            current[index] = o.copy(
+                isCashOrder = !o.isCashOrder,
+                cashToCollect = if (o.isCashOrder) "" else o.cashToCollect
+            )
+            _activeOrders.value = current
+            saveData()
+        }
+    }
+    fun updateOrderTip(orderId: String, tip: String) {
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            current[index] = current[index].copy(tipInput = tip)
+            _activeOrders.value = current
+            recalculateStats()
+            saveData()
+        }
+    }
+
+    /**
+     * 結束批次並自動歸檔至歷史日報 (DailyReport)
+     */
+    fun finalizeBatch() {
+        val orders = _activeOrders.value
+        val validOrders = orders.filter { !it.isDiscarded }
+
+        if (validOrders.isNotEmpty()) {
+            val todayKey = getTodayDateKey()
+            val reports = _dailyReports.value.toMutableMap()
+            val existingReport = reports[todayKey] ?: DailyReport(dateString = todayKey)
+
+            val nextBatchNum = (existingReport.batches.maxOfOrNull { it.batchNumber } ?: 0) + 1
+            val newBatch = DeliveryBatch(
+                batchNumber = nextBatchNum,
+                orders = validOrders,
+                createdAtMillis = System.currentTimeMillis()
+            )
+
+            val updatedBatches = existingReport.batches + newBatch
+            reports[todayKey] = existingReport.copy(batches = updatedBatches)
+            _dailyReports.value = reports
+        }
+
+        timerJob?.cancel()
+        _isDelivering.value = false
+        _activeOrders.value = emptyList()
+        _elapsedSeconds.value = 0L
+        _totalEarnings.value = 0.0
+        _currentHourlyWage.value = 0.0
+        batchStartTimeMillis = 0L
+
+        saveData()
+    }
+
+    /**
+     * 手動補單 (加入到指定歷史日期的報表中)
+     */
+    fun addManualOrder(
+        dateKey: String,
+        startTimeMillis: Long,
+        endTimeMillis: Long,
+        customWage: String,
+        tip: String,
+        note: String
+    ) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: DailyReport(dateString = dateKey)
+
+        val totalOrdersCount = report.batches.sumOf { it.orders.size }
+        val newOrder = DeliveryOrder(
+            orderNumber = totalOrdersCount + 1,
+            startTimeMillis = startTimeMillis,
+            endTimeMillis = endTimeMillis,
+            isCompleted = true,
+            isDiscarded = false,
+            customWageInput = customWage,
+            tipInput = tip,
+            userNote = note,
+            isManualEntry = true
+        )
+
+        val nextBatchNum = (report.batches.maxOfOrNull { it.batchNumber } ?: 0) + 1
+        val newBatch = DeliveryBatch(
+            batchNumber = nextBatchNum,
+            orders = listOf(newOrder),
+            createdAtMillis = startTimeMillis
+        )
+
+        reports[dateKey] = report.copy(batches = report.batches + newBatch)
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /**
+     * 更新 Uber 官方實際匯入金額 (供對帳比對)
+     */
+    fun updateUberActualPayout(dateKey: String, amount: String) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: DailyReport(dateString = dateKey)
+        reports[dateKey] = report.copy(dailyUberActualPayout = amount)
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /** 修改日報裡某一張歷史單（單號、工資、小費、累計工時） */
+    fun updateHistoryOrder(
+        dateKey: String,
+        batchId: String,
+        orderId: String,
+        note: String,
+        wage: String,
+        tip: String,
+        minutes: String
+    ) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: return
+        reports[dateKey] = report.copy(
+            batches = report.batches.map { b ->
+                if (b.id != batchId) b else b.copy(
+                    orders = b.orders.map { o ->
+                        if (o.id != orderId) o else o.copy(
+                            userNote = note,
+                            customWageInput = wage,
+                            tipInput = tip,
+                            manualMinutesOverride = minutes
+                        )
+                    }
+                )
+            }
+        )
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /** 刪掉日報裡某一張歷史單；那一批如果空了，整批一起拿掉 */
+    fun deleteHistoryOrder(dateKey: String, batchId: String, orderId: String) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: return
+        reports[dateKey] = report.copy(
+            batches = report.batches
+                .map { b ->
+                    if (b.id != batchId) b
+                    else b.copy(orders = b.orders.filter { it.id != orderId })
+                }
+                .filter { it.orders.isNotEmpty() }
+        )
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /** 更新熊貓實際入帳金額 */
+    fun updatePandaActualPayout(dateKey: String, amount: String) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: DailyReport(dateString = dateKey)
+        reports[dateKey] = report.copy(dailyPandaActualPayout = amount)
+        _dailyReports.value = reports
+        saveData()
+    }
+    fun selectReportDate(dateKey: String) {
+        _selectedReportDate.value = dateKey
+    }
+
+    private fun checkIfAllOrdersDone() {
+        val unfinished = _activeOrders.value.any { !it.isCompleted }
+        if (!unfinished) {
+            _isDelivering.value = false
+            // 全部單都結束了，把碼表按停
+            timerJob?.cancel()
+            timerJob = null
+            // 全部單都結束了，軌跡也停止（不再耗電）
+            runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.stopDeliverySession() }
+        }
+    }
+
+    fun setHourlyRate(newRate: Double) {
+        if (newRate > 0) {
+            _hourlyRate.value = newRate
+            recalculateStats()
+            saveData()
+        }
+    }
+
+    /**
+     * 將所有歷史報表匯出成標準 CSV 格式字串 (對應 iOS: exportToCSV)
+     */
+    fun exportReportsToCSV(): String {
+        val sb = StringBuilder()
+        sb.append("日期,批次號,訂單號,開始時間,送達時間,狀態,實收工資,小費,平台單號備註\n")
+        val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+
+        val sortedReports = _dailyReports.value.toSortedMap()
+        for ((dateKey, report) in sortedReports) {
+            for (batch in report.batches) {
+                for (order in batch.orders) {
+                    val startStr = sdf.format(Date(order.startTimeMillis))
+                    val endStr = order.endTimeMillis?.let { sdf.format(Date(it)) } ?: "--"
+                    val status = if (order.isDiscarded) "已棄單" else if (order.isCompleted) "已送達" else "未完成"
+                    val wage = order.customWageInput.ifEmpty { order.rawOperationWage.toInt().toString() }
+                    val tip = order.tipInput.ifEmpty { "0" }
+                    val note = order.userNote.replace(",", " ")
+
+                    sb.append("$dateKey,${batch.batchNumber},#${order.orderNumber},$startStr,$endStr,$status,$wage,$tip,$note\n")
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    fun getTodayDateKey(): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+        return sdf.format(Date())
+    }
+
+    fun formatDuration(totalSec: Long): String {
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        val s = totalSec % 60
+        return if (h > 0) {
+            String.format(Locale.getDefault(), "%02d:%02d:%02d", h, m, s)
+        } else {
+            String.format(Locale.getDefault(), "%02d:%02d", m, s)
+        }
+    }
+
+    fun formatTime(millis: Long?): String {
+        if (millis == null) return "--:--"
+        val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
+        return sdf.format(Date(millis))
+    }
+}

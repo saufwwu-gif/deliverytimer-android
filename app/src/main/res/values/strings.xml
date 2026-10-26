@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">薪水計時</string>
+    <string name="accessibility_service_description">讓薪水計時在你按下懸浮球的相機鈕時，幫你截取當下畫面並辨識單號。不會讀取或記錄畫面上的其他內容。</string>
+</resources>
