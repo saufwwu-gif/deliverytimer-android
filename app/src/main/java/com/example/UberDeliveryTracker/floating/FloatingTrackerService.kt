@@ -69,6 +69,7 @@ class FloatingTrackerService : Service() {
         const val EXTRA_IS_OFFER      = "extra_is_offer"
         const val EXTRA_IS_CASH       = "extra_is_cash"
         const val EXTRA_OFFER_SUMMARY = "extra_offer_summary"
+        const val EXTRA_CASH_AMOUNT   = "extra_cash_amount"
         const val ACTION_SHOW_MESSAGE = "com.example.UberDeliveryTracker.ACTION_SHOW_MESSAGE"
         const val EXTRA_MESSAGE       = "extra_message"
     }
@@ -510,7 +511,7 @@ class FloatingTrackerService : Service() {
                     putExtra(EXTRA_ORDER_CODE, detected.orderCode ?: detected.fullOrderNumber ?: "")
                     putExtra(EXTRA_IS_OFFER, detected.isNewOffer)
                     putExtra(EXTRA_IS_CASH, detected.isCash)
-                    putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary)
+                    putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0)
                 }
             )
         }
@@ -541,7 +542,7 @@ class FloatingTrackerService : Service() {
                     putExtra(EXTRA_ORDER_CODE, detected.orderCode ?: detected.fullOrderNumber ?: "")
                     putExtra(EXTRA_IS_OFFER, detected.isNewOffer)
                     putExtra(EXTRA_IS_CASH, detected.isCash)
-                    putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary)
+                    putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0)
                 }
             )
             return
@@ -559,7 +560,7 @@ class FloatingTrackerService : Service() {
                             putExtra(EXTRA_ORDER_CODE, detected.orderCode ?: detected.fullOrderNumber ?: "")
                             putExtra(EXTRA_IS_OFFER, detected.isNewOffer)
                             putExtra(EXTRA_IS_CASH, detected.isCash)
-                            putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary)
+                            putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0)
                         }
                     )
                 },

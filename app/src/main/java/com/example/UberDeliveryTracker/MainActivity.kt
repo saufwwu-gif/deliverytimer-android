@@ -82,18 +82,7 @@ class MainActivity : ComponentActivity() {
                                 icon = { Icon(Icons.Default.DateRange, contentDescription = null) },
                                 label = { Text("日報") }
                             )
-                            NavigationBarItem(
-                                selected = currentTab == 2,
-                                onClick = { currentTab = 2 },
-                                icon = { Icon(Icons.Default.Map, contentDescription = null) },
-                                label = { Text("地圖") }
-                            )
-                            NavigationBarItem(
-                                selected = currentTab == 3,
-                                onClick = { currentTab = 3 },
-                                icon = { Icon(Icons.Default.Build, contentDescription = null) },
-                                label = { Text("保養") }
-                            )
+
                             NavigationBarItem(
                                 selected = currentTab == 4,
                                 onClick = { currentTab = 4 },

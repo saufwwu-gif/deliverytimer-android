@@ -18,9 +18,10 @@ data class DetectedInfo(
     var offerPrice: Double? = null,
     var offerMinutes: Int? = null,
     var offerKm: Double? = null,
-    var isCash: Boolean = false
+    var isCash: Boolean = false,
+    var cashAmount: Double? = null   // 收取費用畫面上要收的金額
 ) {
-    val hasAnything: Boolean get() = isNewOffer || orderCode != null || name != null
+    val hasAnything: Boolean get() = isNewOffer || orderCode != null || name != null || cashAmount != null
 
     val combinedText: String?
         get() {
@@ -88,6 +89,9 @@ object OrderInfoDetector {
 
         // 0. 新來單（還沒按接受的那張卡片）最優先判斷
         detectNewOffer(cleanedLines)?.let { return it }
+
+        // 0.5 收取費用畫面（現金單要收多少）
+        detectCashCollect(cleanedLines)?.let { return it }
 
         val info = DetectedInfo()
 
@@ -181,6 +185,29 @@ object OrderInfoDetector {
         return info
     }
 
+    // 金額：「$505.00」或「505.00」（一定要有 $ 或兩位小數，避免把電量、時間當成金額）
+    private val collectMoneyPattern = Pattern.compile(
+        "^(?:[\\$＄]\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)|([0-9][0-9,]*\\.[0-9]{2}))$"
+    )
+
+    /** 「收取費用」畫面：許須支付下面那個大金額，就是要跟客人收的錢 */
+    private fun detectCashCollect(lines: List<String>): DetectedInfo? {
+        val isCollectScreen = lines.any { it.contains("收取費用") || it.contains("完成付款") }
+        if (!isCollectScreen) return null
+
+        val labelIdx = lines.indexOfFirst { it.contains("支付") || it.contains("須付") || it.contains("應付") }
+        val start = if (labelIdx >= 0) labelIdx else 0
+        for (line in lines.drop(start).take(5)) {
+            val m = collectMoneyPattern.matcher(line.replace(" ", ""))
+            if (m.matches()) {
+                val value = (m.group(1) ?: m.group(2))?.replace(",", "")?.toDoubleOrNull()
+                if (value != null && value > 0) {
+                    return DetectedInfo(isCash = true, cashAmount = value)
+                }
+            }
+        }
+        return null
+    }
     /** 判斷是不是「新來單」卡片；是的話回傳金額、時間、里程、是否現金 */
     private fun detectNewOffer(lines: List<String>): DetectedInfo? {
         val joined = lines.joinToString(" ")

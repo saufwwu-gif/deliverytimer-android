@@ -50,7 +50,8 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
                         orderCode = intent?.getStringExtra(FloatingTrackerService.EXTRA_ORDER_CODE) ?: "",
                         isOffer = intent?.getBooleanExtra(FloatingTrackerService.EXTRA_IS_OFFER, false) ?: false,
                         isCash = intent?.getBooleanExtra(FloatingTrackerService.EXTRA_IS_CASH, false) ?: false,
-                        offerSummary = intent?.getStringExtra(FloatingTrackerService.EXTRA_OFFER_SUMMARY) ?: ""
+                        offerSummary = intent?.getStringExtra(FloatingTrackerService.EXTRA_OFFER_SUMMARY) ?: "",
+                        cashAmount = intent?.getDoubleExtra(FloatingTrackerService.EXTRA_CASH_AMOUNT, -1.0) ?: -1.0
                     )
                 }
                 FloatingTrackerService.ACTION_PICKUP_ORDER -> {
@@ -269,7 +270,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
 
         // 進行中的單，結束時間至少算「接單後 11 分鐘」
         fun endOf(o: DeliveryOrder): Long =
-            o.endTimeMillis ?: maxOf(now, o.startTimeMillis + 11 * 60_000L)
+            maxOf(o.endTimeMillis ?: now, o.startTimeMillis + 11 * 60_000L)
 
         val sorted = all.sortedBy { it.startTimeMillis }
         val first = sorted.firstOrNull() ?: return null
@@ -424,11 +425,18 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         orderCode: String,
         isOffer: Boolean = false,
         isCash: Boolean = false,
-        offerSummary: String = ""
+        offerSummary: String = "",
+        cashAmount: Double = -1.0
     ) {
         val all = _activeOrders.value
         val open = all.filter { !it.isCompleted && !it.isDiscarded }
         val oneLine = noteText.replace("\n", " ")
+
+        // 0) 收取費用畫面：把金額填進現金單
+        if (cashAmount > 0) {
+            handleCashCollect(cashAmount)
+            return
+        }
 
         // 1) 新來單
         if (isOffer) {
@@ -464,6 +472,33 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         val tail = if (noteText.isNotEmpty()) "，單號：$oneLine"
         else "（沒辨識到內容，之後再截有單號的畫面補上）"
         sendMessageToFloating("$head 訂單 #${newOrder?.orderNumber ?: 1}$tail")
+    }
+    /** 收取費用畫面：把要收的金額填進現金單 */
+    private fun handleCashCollect(amount: Double) {
+        val text = if (amount % 1.0 == 0.0) amount.toInt().toString() else "%.2f".format(amount)
+        val all = _activeOrders.value.filter { !it.isDiscarded }
+        if (all.isEmpty()) {
+            sendMessageToFloating("💵 讀到要收 \$$text，但目前沒有單，沒有填入")
+            return
+        }
+        // 同樣的金額已經在某張單裡 → 不重複
+        all.firstOrNull { it.cashToCollect.trim() == text }?.let {
+            sendMessageToFloating("💵 要收 \$$text 已經在訂單 #${it.orderNumber} 裡了")
+            return
+        }
+        val open = all.filter { !it.isCompleted }.sortedBy { it.startTimeMillis }
+        val done = all.filter { it.isCompleted }.sortedByDescending { it.endTimeMillis ?: 0L }
+        val target =
+            open.firstOrNull { it.isCashOrder && it.cashToCollect.isBlank() }
+                ?: done.firstOrNull { it.isCashOrder && it.cashToCollect.isBlank() }
+                ?: open.firstOrNull { it.cashToCollect.isBlank() }
+                ?: done.firstOrNull { it.cashToCollect.isBlank() }
+        if (target == null) {
+            sendMessageToFloating("💵 讀到要收 \$$text，但每張單都已經有金額，沒有蓋掉")
+            return
+        }
+        updateOrderCash(target.id, text)
+        sendMessageToFloating("💵 已填入訂單 #${target.orderNumber} 要收 \$$text")
     }
     private fun sendMessageToFloating(message: String) {
         lbm.sendBroadcast(Intent(FloatingTrackerService.ACTION_SHOW_MESSAGE).apply {
