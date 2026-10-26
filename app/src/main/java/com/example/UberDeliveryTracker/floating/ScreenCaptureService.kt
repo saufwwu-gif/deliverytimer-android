@@ -76,10 +76,15 @@ class ScreenCaptureService : Service() {
         }
 
         try {
-            ServiceCompat.startForeground(
-                this, NOTIFICATION_ID, buildNotification(),
-                if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0
-            )
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
         } catch (e: Exception) {
             shutDown()
             return START_NOT_STICKY
