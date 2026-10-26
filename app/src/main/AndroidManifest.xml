@@ -19,6 +19,12 @@
     <!-- 截圖讀取權限 (自動 OCR 辨識單號) -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- 讓 App 找得到手機的文字轉語音（計時提醒要唸出來） -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
 
     <application
         android:name=".DeliveryApp"

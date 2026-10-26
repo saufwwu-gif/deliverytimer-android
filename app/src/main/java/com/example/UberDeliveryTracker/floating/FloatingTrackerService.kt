@@ -33,6 +33,7 @@ import com.example.UberDeliveryTracker.MainActivity
 import com.example.UberDeliveryTracker.R
 import com.example.UberDeliveryTracker.ocr.ScreenshotObserver
 import com.example.UberDeliveryTracker.ocr.OrderInfoDetector
+import com.example.UberDeliveryTracker.ocr.DetectedInfo
 
 class FloatingTrackerService : Service() {
 
@@ -61,6 +62,7 @@ class FloatingTrackerService : Service() {
         const val EXTRA_ORDER_WAGES     = "extra_order_wages"
         const val EXTRA_ORDER_CASH      = "extra_order_cash"
         const val EXTRA_ORDER_PICKED    = "extra_order_picked"
+        const val EXTRA_TOTAL_EARNINGS  = "extra_total_earnings"
 
         // 截圖 → App，以及 App → 懸浮窗的提示文字
         const val ACTION_SCREENSHOT   = "com.example.UberDeliveryTracker.ACTION_SCREENSHOT"
@@ -112,6 +114,9 @@ class FloatingTrackerService : Service() {
     private var longestSeconds: Long = 0L
     private var selectedId: String? = null
     private var lastUpdateMillis: Long = 0L
+    private var totalEarnings: Double = 0.0
+    private var hourlyWage: Int = 0
+    private var lastNotifyMillis: Long = 0L
 
     // 拖曳用
     private var downX = 0
@@ -133,6 +138,9 @@ class FloatingTrackerService : Service() {
             picked = intent.getBooleanArrayExtra(EXTRA_ORDER_PICKED) ?: BooleanArray(0)
             longestSeconds = intent.getLongExtra(EXTRA_LONGEST_SECONDS, 0L)
             lastUpdateMillis = System.currentTimeMillis()
+            totalEarnings = intent.getDoubleExtra(EXTRA_TOTAL_EARNINGS, 0.0)
+            hourlyWage = intent.getIntExtra(EXTRA_HOURLY_WAGE, 0)
+            updateNotificationNow()
             renderBall()
         }
     }
@@ -154,6 +162,7 @@ class FloatingTrackerService : Service() {
                 longestSeconds = 0L
                 selectedId = null
                 renderBall()
+                resetNotification()
             }
             handler.postDelayed(this, 1000L)
         }
@@ -521,10 +530,11 @@ class FloatingTrackerService : Service() {
     /** 按下相機鈕：先試著直接讀畫面文字；讀不到再截圖辨識 */
     private fun onCameraClicked() {
         val helper = ScreenshotAccessibilityService.instance
-        if (helper == null) {
+        val recorder = ScreenCaptureService.instance
+        if (helper == null && recorder == null) {
             Toast.makeText(
                 this,
-                "無障礙目前是關閉的。請用手機截圖（電源鍵＋音量下），App 會自動辨識",
+                "無障礙和錄影都是關閉的。請用手機截圖（電源鍵＋音量下），App 會自動辨識",
                 Toast.LENGTH_LONG
             ).show()
             return
@@ -532,7 +542,7 @@ class FloatingTrackerService : Service() {
         val ball = floatView ?: return
 
         // 先直接讀畫面上的字；讀得到就不用截圖
-        val lines = helper.readScreenLines()
+        val lines = helper?.readScreenLines() ?: emptyList()
         val direct = if (lines.size >= 3) OrderInfoDetector.detect(lines) else null
         if (direct != null && direct.hasAnything) {
             val detected = direct
@@ -549,27 +559,32 @@ class FloatingTrackerService : Service() {
         }
 
         // 讀不到字 → 把球藏起來，截圖辨識，再把球顯示回來
-        ball.visibility = View.INVISIBLE
-        handler.postDelayed({
-            helper.captureAndRecognize(
-                onDone = { detected ->
-                    ball.visibility = View.VISIBLE
-                    LocalBroadcastManager.getInstance(this).sendBroadcast(
-                        Intent(ACTION_SCREENSHOT).apply {
-                            putExtra(EXTRA_NOTE_TEXT, detected.combinedText ?: "")
-                            putExtra(EXTRA_ORDER_CODE, detected.orderCode ?: detected.fullOrderNumber ?: "")
-                            putExtra(EXTRA_IS_OFFER, detected.isNewOffer)
-                            putExtra(EXTRA_IS_CASH, detected.isCash)
-                            putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0); putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0)
-                        }
-                    )
-                },
-                onFail = { msg ->
-                    ball.visibility = View.VISIBLE
-                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+        val onDone: (DetectedInfo) -> Unit = { detected ->
+            ball.visibility = View.VISIBLE
+            LocalBroadcastManager.getInstance(this).sendBroadcast(
+                Intent(ACTION_SCREENSHOT).apply {
+                    putExtra(EXTRA_NOTE_TEXT, detected.combinedText ?: "")
+                    putExtra(EXTRA_ORDER_CODE, detected.orderCode ?: detected.fullOrderNumber ?: "")
+                    putExtra(EXTRA_IS_OFFER, detected.isNewOffer)
+                    putExtra(EXTRA_IS_CASH, detected.isCash)
+                    putExtra(EXTRA_OFFER_SUMMARY, detected.offerSummary)
+                    putExtra(EXTRA_CASH_AMOUNT, detected.cashAmount ?: -1.0)
                 }
             )
-        }, 250L)
+        }
+        val onFail: (String) -> Unit = { msg ->
+            ball.visibility = View.VISIBLE
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+        }
+
+        ball.visibility = View.INVISIBLE
+        if (helper != null) {
+            // 無障礙開著：優先用無障礙
+            handler.postDelayed({ helper.captureAndRecognize(onDone, onFail) }, 250L)
+        } else if (recorder != null) {
+            // 只有錄影開著：多等一下，確保畫面裡球已經消失
+            handler.postDelayed({ recorder.captureAndRecognize(onDone, onFail) }, 500L)
+        }
     }
     private fun createNotification(): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -588,6 +603,36 @@ class FloatingTrackerService : Service() {
             .build()
     }
 
+    /** 把通知換成即時儀表板：金額、時薪、進行中單數，右側自己跳秒 */
+    private fun updateNotificationNow() {
+        if (ids.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (now - lastNotifyMillis < 5000L) return // 每 5 秒才換一次字，省電
+        lastNotifyMillis = now
+
+        val tenMin = hourlyWage / 6
+        val pi = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
+        val n = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("💰 \$${totalEarnings.toInt()}　時薪 $hourlyWage")
+            .setContentText("進行中 ${ids.size} 單｜10 分鐘的單至少 \$$tenMin")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(true)
+            .setUsesChronometer(true)
+            .setWhen(now - longestSeconds * 1000L)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, n)
+    }
+
+    /** 沒有進行中的單了，通知變回原本的樣子 */
+    private fun resetNotification() {
+        lastNotifyMillis = 0L
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, createNotification())
+    }
     override fun onDestroy() {
         super.onDestroy()
         handler.removeCallbacksAndMessages(null)

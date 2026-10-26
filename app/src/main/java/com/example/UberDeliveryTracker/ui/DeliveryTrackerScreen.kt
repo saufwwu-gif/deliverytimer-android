@@ -51,7 +51,8 @@ fun DeliveryTrackerScreen(
     val totalEarnings by viewModel.totalEarnings.collectAsState()
     val currentHourlyWage by viewModel.currentHourlyWage.collectAsState()
     val shift by viewModel.shift.collectAsState()
-
+    val lastFinalized by viewModel.lastFinalized.collectAsState()
+    val testMode by viewModel.testMode.collectAsState()
     var showEstimatorDialog by remember { mutableStateOf(false) }
     var summaryExpanded by remember { mutableStateOf(false) }
     var actionsVisible by remember { mutableStateOf(true) }
@@ -179,6 +180,13 @@ fun DeliveryTrackerScreen(
                 onUndo = { viewModel.undoEndShift() },
                 onOpenWageSettings = { showWageDialog = true }
             )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("🔔 5 秒測試提醒（測試用）", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                Switch(checked = testMode, onCheckedChange = { viewModel.setTestMode(it) })
+            }
         }
 
         // ── 開始 / 加單按鈕（可收起）──
@@ -189,6 +197,38 @@ fun DeliveryTrackerScreen(
             onPick = startOrAdd
         )
 
+        // ── 上一趟剛結束：誤觸可以復原 ──
+        val finished = lastFinalized
+        if (finished != null && activeOrders.isEmpty()) {
+            val totalText = "%.1f".format(finished.total)
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text("上一趟已結束，已收進今天的日報", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(
+                        "共 ${finished.orderCount} 單，合計 \$$totalText。如果剛才是誤按送達或棄單，可以按「復原此趟」，計時會補回經過的時間。",
+                        fontSize = 12.sp,
+                        color = Color.DarkGray
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { viewModel.dismissLastFinalized() },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("忽略") }
+                        Button(
+                            onClick = { viewModel.restoreLastFinalized() },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("復原此趟") }
+                    }
+                }
+            }
+        }
         // ── 訂單清單 ──
         if (activeOrders.isEmpty()) {
             Box(
@@ -386,6 +426,8 @@ fun OrderCard(
     viewModel: DeliveryTrackerViewModel
 ) {
     var editing by remember { mutableStateOf(false) }
+    val lastRestore by viewModel.lastRestore.collectAsState()
+    var confirmUndo by remember { mutableStateOf(false) }
 
     val cardBg = when {
         order.isDiscarded -> Color(0xFFFFEBEE)
@@ -509,6 +551,33 @@ fun OrderCard(
 
             CashFieldRow(order = order, viewModel = viewModel)
             Spacer(modifier = Modifier.height(8.dp))
+
+            // 剛復原的這一單：還來得及撤銷
+            if (!order.isCompleted && lastRestore?.orderId == order.id) {
+                OutlinedButton(
+                    onClick = { confirmUndo = true },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(34.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
+                ) { Text("取消復原（改回剛才完成的狀態）", fontSize = 12.sp) }
+            }
+            if (confirmUndo) {
+                AlertDialog(
+                    onDismissRequest = { confirmUndo = false },
+                    title = { Text("取消剛才的復原？") },
+                    text = { Text("這一單會改回復原前的狀態，並恢復原本的送達時間。") },
+                    confirmButton = {
+                        Button(onClick = {
+                            viewModel.undoRestoreOrder()
+                            confirmUndo = false
+                        }) { Text("取消復原") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmUndo = false }) { Text("再想一下") }
+                    }
+                )
+            }
             // 第三行：操作按鈕
             if (!order.isCompleted) {
                 Row(

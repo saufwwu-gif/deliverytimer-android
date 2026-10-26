@@ -6,6 +6,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.speech.tts.TextToSpeech
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.example.UberDeliveryTracker.MainActivity
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -81,6 +88,27 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     // 進行中的訂單清單
     private val _activeOrders = MutableStateFlow<List<DeliveryOrder>>(emptyList())
     val activeOrders: StateFlow<List<DeliveryOrder>> = _activeOrders.asStateFlow()
+    // 最後一次「復原」之前的樣子，讓誤按復原可以撤銷
+    data class RestoreSnapshot(
+        val orderId: String,
+        val wasCompleted: Boolean,
+        val wasDiscarded: Boolean,
+        val previousEndTimeMillis: Long?
+    )
+    private val _lastRestore = MutableStateFlow<RestoreSnapshot?>(null)
+    val lastRestore: StateFlow<RestoreSnapshot?> = _lastRestore.asStateFlow()
+
+    // 上一趟結束前的樣子，讓誤觸結束可以「復原上一趟」
+    data class FinalizedSnapshot(
+        val dateKey: String,
+        val batchId: String?,
+        val orders: List<DeliveryOrder>,
+        val reopenOrderId: String?,
+        val orderCount: Int,
+        val total: Double
+    )
+    private val _lastFinalized = MutableStateFlow<FinalizedSnapshot?>(null)
+    val lastFinalized: StateFlow<FinalizedSnapshot?> = _lastFinalized.asStateFlow()
 
     // 歷史每日報表集合 (Key: "yyyy-MM-dd")
     private val _dailyReports = MutableStateFlow<Map<String, DailyReport>>(emptyMap())
@@ -135,6 +163,14 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     private var shiftOffMillis: Long = 0L
     private var shiftOffPreviousMillis: Long = 0L
     private var shiftJob: Job? = null
+    // ───────── 計時提醒用的小格子（要放在 init 前面）─────────
+    private val spokenMilestones = mutableSetOf<String>()
+    private var lastTestSecond = -1L
+    private var speech: TextToSpeech? = null
+    private var speechReady = false
+
+    private val _testMode = MutableStateFlow(false)
+    val testMode: StateFlow<Boolean> = _testMode.asStateFlow()
 
     init {
         loadSavedData()
@@ -149,6 +185,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         lbm.registerReceiver(floatingActionReceiver, filter)
         loadShiftOff()
         startShiftTicker()
+        initSpeech()
     }
 
     private fun loadSavedData() {
@@ -199,6 +236,83 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         }
     }
 
+    // ───────── 計時提醒：滿 11 分鐘、之後每 10 分鐘，用通知加聲音提醒 ─────────
+
+    /** 5 秒測試：打開後每 5 秒提醒一次 */
+    fun setTestMode(on: Boolean) {
+        _testMode.value = on
+        lastTestSecond = -1L
+    }
+
+    private fun initSpeech() {
+        speech = TextToSpeech(getApplication<Application>()) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                val r = speech?.setLanguage(Locale.TAIWAN) ?: TextToSpeech.ERROR
+                speechReady = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+            }
+        }
+    }
+
+    private fun checkReminders() {
+        val open = _activeOrders.value.filter { !it.isCompleted && !it.isDiscarded }
+        if (open.isEmpty()) return
+
+        // 測試模式：每 5 秒提醒一次
+        if (_testMode.value) {
+            val sec = _elapsedSeconds.value
+            if (sec > 0 && sec % 5L == 0L && sec != lastTestSecond) {
+                lastTestSecond = sec
+                remind("【測試】外送計時提醒", "目前計時已過 $sec 秒")
+            }
+            return
+        }
+
+        // 同一時間按下去的單算一組：滿 11 分鐘，之後 20、30、40… 分鐘各提醒一次
+        val now = System.currentTimeMillis()
+        for ((startMillis, group) in open.groupBy { it.startTimeMillis }) {
+            val min = ((now - startMillis) / 60_000L).toInt()
+            val hit = min == 11 || (min >= 20 && min % 10 == 0)
+            if (hit && spokenMilestones.add("$startMillis:$min")) {
+                val nums = group.map { it.orderNumber }.sorted().joinToString("、")
+                remind("外送時間提醒", "第${nums}單已滿 $min 分鐘")
+            }
+        }
+    }
+
+    private fun remind(title: String, body: String) {
+        sendReminderNotification(title, body)
+        if (speechReady) speech?.speak(body, TextToSpeech.QUEUE_ADD, null, "remind")
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun sendReminderNotification(title: String, body: String) {
+        val app = getApplication<Application>()
+        runCatching {
+            val channelId = "RemindChannel"
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                val ch = NotificationChannel(channelId, "計時提醒", NotificationManager.IMPORTANCE_HIGH)
+                app.getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+            }
+            val pi = PendingIntent.getActivity(
+                app, 0, Intent(app, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+            )
+            val n = NotificationCompat.Builder(app, channelId)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build()
+            NotificationManagerCompat.from(app)
+                .notify(2000 + (System.currentTimeMillis() % 100000).toInt(), n)
+        }
+    }
+
+    override fun onCleared() {
+        speech?.stop()
+        speech?.shutdown()
+        super.onCleared()
+    }
     private fun startTimer() {
         timerJob?.cancel()
         timerJob = viewModelScope.launch {
@@ -207,6 +321,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
                     val now = System.currentTimeMillis()
                     _elapsedSeconds.value = maxOf(0L, (now - batchStartTimeMillis) / 1000L)
                     recalculateStats()
+                    checkReminders()
                     // 每秒推送即時數據給懸浮窗
                     pushDisplayUpdateToFloating()
                 }
@@ -366,6 +481,8 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
 
         lbm.sendBroadcast(Intent(FloatingTrackerService.ACTION_UPDATE_ORDERS).apply {
             putExtra(FloatingTrackerService.EXTRA_LONGEST_SECONDS, longest)
+            putExtra(FloatingTrackerService.EXTRA_TOTAL_EARNINGS, _totalEarnings.value)
+            putExtra(FloatingTrackerService.EXTRA_HOURLY_WAGE, _currentHourlyWage.value.toInt())
             putExtra(FloatingTrackerService.EXTRA_ORDER_IDS, open.map { it.id }.toTypedArray())
             putExtra(FloatingTrackerService.EXTRA_ORDER_NUMBERS, open.map { it.orderNumber }.toIntArray())
             putExtra(FloatingTrackerService.EXTRA_ORDER_NOTES, open.map { it.userNote }.toTypedArray())
@@ -510,6 +627,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.startNewDeliverySession() }
         val now = System.currentTimeMillis()
         batchStartTimeMillis = now
+        _lastFinalized.value = null
 
         val newOrders = (1..initialOrderCount).map { i ->
             DeliveryOrder(
@@ -595,6 +713,12 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
                 isDiscarded = false,
                 endTimeMillis = null
             )
+            _lastRestore.value = RestoreSnapshot(
+                orderId = target.id,
+                wasCompleted = target.isCompleted,
+                wasDiscarded = target.isDiscarded,
+                previousEndTimeMillis = target.endTimeMillis
+            )
             _activeOrders.value = current
             _isDelivering.value = true
             // 復原後軌跡也要繼續記錄（不清掉原本的點）
@@ -607,6 +731,26 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         }
     }
 
+    /** 取消上一次的「復原」：那一單改回復原前的樣子（含原本的結束時間） */
+    fun undoRestoreOrder() {
+        val snap = _lastRestore.value ?: return
+        val current = _activeOrders.value.toMutableList()
+        val index = current.indexOfFirst { it.id == snap.orderId }
+        if (index == -1) {
+            _lastRestore.value = null
+            return
+        }
+        current[index] = current[index].copy(
+            isCompleted = snap.wasCompleted,
+            isDiscarded = snap.wasDiscarded,
+            endTimeMillis = snap.previousEndTimeMillis
+        )
+        _activeOrders.value = current
+        _lastRestore.value = null
+        checkIfAllOrdersDone()
+        recalculateStats()
+        saveData()
+    }
     fun updateOrderNote(orderId: String, note: String) {
         val current = _activeOrders.value.toMutableList()
         val index = current.indexOfFirst { it.id == orderId }
@@ -685,9 +829,10 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     fun finalizeBatch() {
         val orders = _activeOrders.value
         val validOrders = orders.filter { !it.isDiscarded }
+        val todayKey = getTodayDateKey()
+        var savedBatchId: String? = null
 
         if (validOrders.isNotEmpty()) {
-            val todayKey = getTodayDateKey()
             val reports = _dailyReports.value.toMutableMap()
             val existingReport = reports[todayKey] ?: DailyReport(dateString = todayKey)
 
@@ -697,10 +842,24 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
                 orders = validOrders,
                 createdAtMillis = System.currentTimeMillis()
             )
+            savedBatchId = newBatch.id
 
             val updatedBatches = existingReport.batches + newBatch
             reports[todayKey] = existingReport.copy(batches = updatedBatches)
             _dailyReports.value = reports
+        }
+
+        if (orders.isNotEmpty()) {
+            // 全部單都結束的話，最後結束的那一單，就是復原時要重新打開的那一單
+            val allClosed = orders.all { it.isCompleted }
+            _lastFinalized.value = FinalizedSnapshot(
+                dateKey = todayKey,
+                batchId = savedBatchId,
+                orders = orders,
+                reopenOrderId = if (allClosed) orders.maxByOrNull { it.endTimeMillis ?: 0L }?.id else null,
+                orderCount = validOrders.size,
+                total = validOrders.sumOf { it.totalOrderEarnings() }
+            )
         }
 
         timerJob?.cancel()
@@ -818,6 +977,42 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         _dailyReports.value = reports
         saveData()
     }
+    /** 復原上一趟：把剛結束的那一趟從日報拿出來，放回跑單頁繼續計時 */
+    fun restoreLastFinalized() {
+        val snap = _lastFinalized.value ?: return
+        // 從日報拿掉剛存進去的那一批
+        val batchId = snap.batchId
+        if (batchId != null) {
+            val reports = _dailyReports.value.toMutableMap()
+            val report = reports[snap.dateKey]
+            if (report != null) {
+                reports[snap.dateKey] = report.copy(
+                    batches = report.batches.filter { it.id != batchId }
+                )
+                _dailyReports.value = reports
+            }
+        }
+        // 放回跑單頁，最後結束的那一單重新打開
+        val restored = snap.orders.map { o ->
+            if (o.id == snap.reopenOrderId) {
+                o.copy(isCompleted = false, isDiscarded = false, endTimeMillis = null)
+            } else o
+        }
+        _activeOrders.value = restored
+        batchStartTimeMillis = restored.minOfOrNull { it.startTimeMillis } ?: System.currentTimeMillis()
+        _isDelivering.value = restored.any { !it.isCompleted }
+        _lastFinalized.value = null
+        _lastRestore.value = null
+        runCatching { GPSLocationManager.instance.startTracking() }
+        startTimer()
+        recalculateStats()
+        saveData()
+    }
+
+    /** 不要復原了，把提示收起來 */
+    fun dismissLastFinalized() {
+        _lastFinalized.value = null
+    }
     fun selectReportDate(dateKey: String) {
         _selectedReportDate.value = dateKey
     }
@@ -831,6 +1026,8 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
             timerJob = null
             // 全部單都結束了，軌跡也停止（不再耗電）
             runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.stopDeliverySession() }
+            // 全部單都結束了，自動收進今天的日報（跟 iPhone 版一樣）
+            if (_activeOrders.value.isNotEmpty()) finalizeBatch()
         }
     }
 

@@ -187,20 +187,25 @@ object OrderInfoDetector {
 
     // 金額：「$505.00」或「505.00」（一定要有 $ 或兩位小數，避免把電量、時間當成金額）
     private val collectMoneyPattern = Pattern.compile(
-        "^(?:[\\$＄]\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)|([0-9][0-9,]*\\.[0-9]{2}))$"
+        "^(?:[\\$＄]\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)|([0-9][0-9,]*\\.[0-9]{2})|([0-9][0-9,]*(?:\\.[0-9]+)?)[\\$＄])$"
     )
 
     /** 「收取費用」畫面：許須支付下面那個大金額，就是要跟客人收的錢 */
     private fun detectCashCollect(lines: List<String>): DetectedInfo? {
-        val isCollectScreen = lines.any { it.contains("收取費用") || it.contains("完成付款") }
+        val isPandaCash = lines.any { it.contains("向消費者收取現金") } ||
+                (lines.any { it.contains("付款方式") } && lines.any { it.contains("收取現金") })
+        val isCollectScreen = isPandaCash ||
+                lines.any { it.contains("收取費用") || it.contains("完成付款") }
         if (!isCollectScreen) return null
 
         val labelIdx = lines.indexOfFirst { it.contains("支付") || it.contains("須付") || it.contains("應付") }
         val start = if (labelIdx >= 0) labelIdx else 0
-        for (line in lines.drop(start).take(5)) {
+        // 熊貓畫面的金額離標題比較遠，整個畫面都找
+        val scanLines = if (isPandaCash) lines else lines.drop(start).take(5)
+        for (line in scanLines) {
             val m = collectMoneyPattern.matcher(line.replace(" ", ""))
             if (m.matches()) {
-                val value = (m.group(1) ?: m.group(2))?.replace(",", "")?.toDoubleOrNull()
+                val value = (m.group(1) ?: m.group(2) ?: m.group(3))?.replace(",", "")?.toDoubleOrNull()
                 if (value != null && value > 0) {
                     return DetectedInfo(isCash = true, cashAmount = value)
                 }
@@ -230,7 +235,7 @@ object OrderInfoDetector {
                 val mins = totalMatcher.group(2)?.toIntOrNull() ?: 0
                 return DetectedInfo(
                     isNewOffer = true,
-                    offerPlatform = "Uber",
+                    offerPlatform = if (lines.any { it.contains("雷達") }) "Uber雷達" else "Uber",
                     offerPrice = price,
                     offerMinutes = hours * 60 + mins,
                     offerKm = totalMatcher.group(3)?.toDoubleOrNull(),
