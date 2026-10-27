@@ -26,7 +26,8 @@ import java.util.Locale
 @Composable
 fun BiweeklyScreen(
     viewModel: DeliveryTrackerViewModel,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onImportUberCSV: () -> Unit = {}
 ) {
     val reports by viewModel.dailyReports.collectAsState()
     var offset by remember { mutableStateOf(0) }
@@ -39,6 +40,14 @@ fun BiweeklyScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(vertical = 12.dp)
     ) {
+        item {
+            FilledTonalButton(
+                onClick = onImportUberCSV,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("📥 匯入 Uber CSV，自動填入每天實發金額", fontSize = 13.sp)
+            }
+        }
         // 週期切換
         item {
             Card(
@@ -108,6 +117,14 @@ fun BiweeklyScreen(
             DayRow(result.week2[i], viewModel)
         }
 
+        item {
+            val chartDays = result.week1 + result.week2
+            BaselineChartCard(
+                labels = chartDays.map { it.dateKey.drop(5).replace("-", "/") },
+                actual = chartDays.map { it.estimated },
+                baseline = chartDays.map { BiweeklyCalc.incomeBaseline(it.dateKey, reports) }
+            )
+        }
         // 總計
         item {
             Card(
@@ -210,6 +227,14 @@ private fun DayRow(day: BiweeklyDay, viewModel: DeliveryTrackerViewModel) {
                     color = Color.Gray
                 )
             }
+            OutlinedTextField(
+                value = report?.dailyNote ?: "",
+                onValueChange = { viewModel.updateDailyNote(day.dateKey, it) },
+                label = { Text("📝 備註", fontSize = 10.sp) },
+                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = report?.dailyUberActualPayout ?: "",
@@ -230,6 +255,37 @@ private fun DayRow(day: BiweeklyDay, viewModel: DeliveryTrackerViewModel) {
                     singleLine = true
                 )
             }
+        }
+    }
+}
+@Composable
+private fun BaselineChartCard(
+    labels: List<String>,
+    actual: List<Double?>,
+    baseline: List<Double?>
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("本期估算金額 vs 過去8週同星期幾基準", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            SimpleLineChart(
+                labels = labels,
+                series = listOf(
+                    ChartSeries("本期估算", Color(0xFF1976D2), actual),
+                    ChartSeries("過去8週基準", Color(0xFF8E24AA), baseline)
+                )
+            )
+            Text(
+                "藍線是這 14 天每天 App 估算的金額；紫線是過去 8 週「同一個星期幾」的平均，" +
+                        "可以看出這期哪幾天比過去同星期幾好或差。資料不到 4 天的日子不畫紫線。",
+                fontSize = 11.sp,
+                color = Color.Gray
+            )
         }
     }
 }

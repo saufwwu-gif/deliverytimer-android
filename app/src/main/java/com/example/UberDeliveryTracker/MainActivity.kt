@@ -55,6 +55,72 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // 匯出 CSV：跳出「存到哪裡」的畫面
+    private var pendingCsv: String = ""
+    private val csvExportLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        if (uri != null) {
+            val ok = runCatching {
+                contentResolver.openOutputStream(uri)?.use {
+                    it.write(pendingCsv.toByteArray(Charsets.UTF_8))
+                }
+            }.isSuccess
+            Toast.makeText(this, if (ok) "✅ 備份已存好" else "存檔失敗", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // 匯入 CSV：跳出「選哪個檔案」的畫面
+    private val csvImportLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            val text = runCatching {
+                contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }.getOrNull()
+            if (text.isNullOrEmpty()) {
+                Toast.makeText(this, "讀不到這個檔案", Toast.LENGTH_LONG).show()
+            } else {
+                val n = deliveryViewModel.importFromCSV(text)
+                Toast.makeText(
+                    this,
+                    if (n > 0) "✅ 已匯入 $n 張單" else "沒有新增任何單（可能已經匯入過，或格式不對）",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    private fun saveCSVFile(csvContent: String) {
+        if (csvContent.lines().size <= 2) {
+            Toast.makeText(this, "目前尚無歷史跑單資料可匯出", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingCsv = csvContent
+        val day = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+            .format(java.util.Date())
+        csvExportLauncher.launch("DeliveryBackup_$day.csv")
+    }
+    // 匯入 Uber 收入明細 CSV：跳出「選哪個檔案」的畫面
+    private val uberCsvImportLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            val text = runCatching {
+                contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }.getOrNull()
+            if (text.isNullOrEmpty()) {
+                Toast.makeText(this, "讀不到這個檔案", Toast.LENGTH_LONG).show()
+            } else {
+                val days = deliveryViewModel.importUberCSV(text)
+                Toast.makeText(
+                    this,
+                    if (days > 0) "✅ 已填入 $days 天的 Uber 實發金額" else "沒讀到任何金額（檔案格式可能不對）",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -108,7 +174,8 @@ class MainActivity : ComponentActivity() {
                         )
                         1 -> DailyReportsScreen(
                             viewModel = deliveryViewModel,
-                            onExportCSV = { csvText -> shareCSV(csvText) },
+                            onExportCSV = { csvText -> saveCSVFile(csvText) },
+                            onImportCSV = { csvImportLauncher.launch("*/*") },
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(innerPadding)
@@ -120,6 +187,7 @@ class MainActivity : ComponentActivity() {
                                 .padding(innerPadding)
                         )
                         4 -> BiweeklyScreen(
+                            onImportUberCSV = { uberCsvImportLauncher.launch("*/*") },
                             viewModel = deliveryViewModel,
                             modifier = Modifier
                                 .fillMaxSize()

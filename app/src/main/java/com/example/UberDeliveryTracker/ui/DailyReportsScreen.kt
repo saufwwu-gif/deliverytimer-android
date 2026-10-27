@@ -20,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.UberDeliveryTracker.model.BiweeklyCalc
 import com.example.UberDeliveryTracker.model.DailyReport
 import com.example.UberDeliveryTracker.model.DeliveryBatch
 import com.example.UberDeliveryTracker.model.DeliveryOrder
@@ -32,6 +33,7 @@ import java.util.*
 fun DailyReportsScreen(
     viewModel: DeliveryTrackerViewModel,
     onExportCSV: (String) -> Unit = {},
+    onImportCSV: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val dailyReports by viewModel.dailyReports.collectAsState()
@@ -49,6 +51,13 @@ fun DailyReportsScreen(
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
                 ),
                 actions = {
+                    FilledTonalButton(
+                        onClick = onImportCSV,
+                        modifier = Modifier.padding(end = 4.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("📥 匯入CSV", fontSize = 12.sp)
+                    }
                     FilledTonalButton(
                         onClick = {
                             val csvData = viewModel.exportReportsToCSV()
@@ -81,6 +90,8 @@ fun DailyReportsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // 0. 雙週結算卡（點一下展開）
+            BiweeklySummaryCard(viewModel = viewModel, selectedDateKey = selectedDateKey)
             // 1. 日期快速導航列
             DateNavigationBar(
                 currentDateKey = selectedDateKey,
@@ -93,6 +104,14 @@ fun DailyReportsScreen(
                 onUberActualChange = { viewModel.updateUberActualPayout(selectedDateKey, it) }
             )
 
+            // 2.5 每日備註
+            OutlinedTextField(
+                value = currentReport.dailyNote,
+                onValueChange = { viewModel.updateDailyNote(selectedDateKey, it) },
+                label = { Text("📝 今日備註（例：下雨、提早收工）", fontSize = 11.sp) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
             // 3. 批次與訂單清單
             Text(
                 text = "跑單批次明細 (${currentReport.batches.size} 批 / 共 ${currentReport.totalOrdersCount} 單)",
@@ -297,6 +316,10 @@ fun BatchCard(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            BatchSummaryCard(batch = batch, viewModel = viewModel)
+            Spacer(modifier = Modifier.height(8.dp))
+            UberCompareSection(batch = batch, dateKey = dateKey, viewModel = viewModel)
+            Spacer(modifier = Modifier.height(8.dp))
             batch.orders.forEach { order ->
                 var editing by remember { mutableStateOf(false) }
                 if (editing) {
@@ -543,4 +566,339 @@ fun HistoryOrderEditDialog(
             }
         }
     )
+}
+// ───────────────────────── 趟次小結卡 ─────────────────────────
+
+@Composable
+fun BatchSummaryCard(
+    batch: DeliveryBatch,
+    viewModel: DeliveryTrackerViewModel
+) {
+    val valid = batch.validOrders
+    if (valid.isEmpty()) return
+
+    val extra = batch.estimatedLateStartSeconds
+    val minutesList = valid.map { it.adjustedMinutes(extra) }
+    val totalMins = minutesList.sum()
+    val formula = minutesList.joinToString(" + ") { "${it}分" }
+    val ridingMins = (batch.appBatchDurationSeconds / 60.0).toInt()
+    val startText = viewModel.formatTime(batch.orders.minOfOrNull { it.startTimeMillis })
+    val endText = viewModel.formatTime(batch.orders.mapNotNull { it.endTimeMillis }.maxOrNull())
+    val wage = batch.totalAdjustedBatchWage
+    val tips = batch.totalBatchTips
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("趟次小結", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text(
+                    "共 ${valid.size} 單",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFFFF9800)
+                )
+            }
+
+            Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
+                Text("接單 $startText　結束 $endText", fontSize = 11.sp, color = Color.Gray)
+                Text(
+                    "實際外送騎乘: $ridingMins 分鐘",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFFFF9800)
+                )
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                valid.chunked(3).forEach { rowOrders ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        rowOrders.forEach { o ->
+                            val label = if (o.userNote.isEmpty()) "#${o.orderNumber}" else o.userNote
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .background(Color(0x1AFF9800), RoundedCornerShape(8.dp))
+                                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    label,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 2,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                                Text(
+                                    "\$%.0f".format(o.totalOrderEarnings(extra)),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF2E7D32)
+                                )
+                            }
+                        }
+                        repeat(3 - rowOrders.size) {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+
+            Divider(color = Color.LightGray.copy(alpha = 0.5f))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("本趟總收入", fontSize = 11.sp, color = Color.Gray)
+                    Text(
+                        "\$%.1f".format(wage + tips),
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color(0xFF2E7D32)
+                    )
+                }
+                Text(
+                    "車資\$%.1f + 小費\$%.1f".format(wage, tips),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Divider(color = Color.LightGray.copy(alpha = 0.5f))
+
+            Text(
+                "每單累計工時: $formula = $totalMins 分鐘",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF1976D2)
+            )
+        }
+    }
+}
+// ───────────────────────── Uber 紀錄對比 ─────────────────────────
+
+@Composable
+fun UberCompareSection(
+    batch: DeliveryBatch,
+    dateKey: String,
+    viewModel: DeliveryTrackerViewModel
+) {
+    fun clean(s: String): String = s.filter { it.isDigit() }.take(2)
+
+    fun save(sh: String, sm: String, dh: String, dm: String, ds: String) {
+        viewModel.updateBatchUberCompare(dateKey, batch.id, sh, sm, dh, dm, ds)
+    }
+
+    val numberKeys = KeyboardOptions(keyboardType = KeyboardType.Number)
+    val small = androidx.compose.ui.text.TextStyle(fontSize = 13.sp)
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Uber 紀錄對比", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text("開始:", fontSize = 12.sp)
+            OutlinedTextField(
+                value = batch.uberStartTimeHour,
+                onValueChange = {
+                    save(clean(it), batch.uberStartTimeMinute, batch.uberDurationHours, batch.uberDurationMinutes, batch.uberDurationSeconds)
+                },
+                label = { Text("時", fontSize = 10.sp) },
+                textStyle = small,
+                keyboardOptions = numberKeys,
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Text(":")
+            OutlinedTextField(
+                value = batch.uberStartTimeMinute,
+                onValueChange = {
+                    save(batch.uberStartTimeHour, clean(it), batch.uberDurationHours, batch.uberDurationMinutes, batch.uberDurationSeconds)
+                },
+                label = { Text("分", fontSize = 10.sp) },
+                textStyle = small,
+                keyboardOptions = numberKeys,
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.weight(2f))
+        }
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text("歷時:", fontSize = 12.sp)
+            OutlinedTextField(
+                value = batch.uberDurationHours,
+                onValueChange = {
+                    save(batch.uberStartTimeHour, batch.uberStartTimeMinute, clean(it), batch.uberDurationMinutes, batch.uberDurationSeconds)
+                },
+                label = { Text("時", fontSize = 10.sp) },
+                textStyle = small,
+                keyboardOptions = numberKeys,
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Text("h", fontSize = 12.sp)
+            OutlinedTextField(
+                value = batch.uberDurationMinutes,
+                onValueChange = {
+                    save(batch.uberStartTimeHour, batch.uberStartTimeMinute, batch.uberDurationHours, clean(it), batch.uberDurationSeconds)
+                },
+                label = { Text("分", fontSize = 10.sp) },
+                textStyle = small,
+                keyboardOptions = numberKeys,
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Text("m", fontSize = 12.sp)
+            OutlinedTextField(
+                value = batch.uberDurationSeconds,
+                onValueChange = {
+                    save(batch.uberStartTimeHour, batch.uberStartTimeMinute, batch.uberDurationHours, batch.uberDurationMinutes, clean(it))
+                },
+                label = { Text("秒", fontSize = 10.sp) },
+                textStyle = small,
+                keyboardOptions = numberKeys,
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Text("s", fontSize = 12.sp)
+        }
+
+        batch.startTimeDiffString?.let {
+            Text(it, fontSize = 11.sp, color = Color(0xFF1976D2))
+        }
+        val analysis = batch.autoAnalysisResult
+        if (analysis.isNotEmpty()) {
+            Text(analysis, fontSize = 11.sp, color = Color(0xFFFF9800))
+        }
+    }
+}
+// ───────────────────────── 雙週結算卡 ─────────────────────────
+
+@Composable
+fun BiweeklySummaryCard(
+    viewModel: DeliveryTrackerViewModel,
+    selectedDateKey: String
+) {
+    val reports by viewModel.dailyReports.collectAsState()
+    val payouts by viewModel.biweeklyPayouts.collectAsState()
+    val s = remember(selectedDateKey, reports) { BiweeklyCalc.summarize(selectedDateKey, reports) }
+    val payoutText = payouts[s.cycleKey] ?: ""
+    val payout = payoutText.toDoubleOrNull() ?: 0.0
+    val diff = payout - s.totalIncome
+    var expanded by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { expanded = !expanded },
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("雙週結算 ${s.title}", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(
+                    "App預估 \$%.0f".format(s.totalIncome),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    color = Color(0xFF1976D2)
+                )
+                Text(if (expanded) "▲" else "▼", fontSize = 12.sp, color = Color.Gray)
+            }
+
+            if (expanded) {
+                Divider(color = Color.LightGray.copy(alpha = 0.5f))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("完成單數: ${s.orderCount} 單", fontSize = 12.sp)
+                    Text(
+                        "累計工時: ${s.summedMinutes.toInt()}分",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF1976D2)
+                    )
+                    Text(
+                        "騎乘: ${s.ridingMinutes.toInt()}分",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFFF9800)
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text("操作估算", fontSize = 10.sp, color = Color.Gray)
+                        Text("\$%.1f".format(s.rawWage), fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+                    }
+                    Column {
+                        Text("補足估算", fontSize = 10.sp, color = Color.Gray)
+                        Text("\$%.1f".format(s.adjustedWage), fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32))
+                    }
+                    Column {
+                        Text("顧客小費", fontSize = 10.sp, color = Color.Gray)
+                        Text("+\$%.1f".format(s.tips), fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFF9800))
+                    }
+                    Column {
+                        Text("App預估總額", fontSize = 10.sp, color = Color.Gray)
+                        Text("\$%.1f".format(s.totalIncome), fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1976D2))
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedTextField(
+                        value = payoutText,
+                        onValueChange = { viewModel.updateBiweeklyPayout(s.cycleKey, it) },
+                        label = { Text("Uber 整期實際入帳 ($)", fontSize = 11.sp) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (payout > 0) {
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("對帳差額", fontSize = 10.sp, color = Color.Gray)
+                            Text(
+                                (if (diff >= 0) "+\$" else "-\$") + "%.1f".format(kotlin.math.abs(diff)),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                color = if (diff >= 0) Color(0xFF2E7D32) else Color.Red
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

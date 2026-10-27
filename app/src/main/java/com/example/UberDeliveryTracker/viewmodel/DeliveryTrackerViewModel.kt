@@ -46,6 +46,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     private val KEY_BATCH_START_TIME = "SavedBatchStartTime"
     private val KEY_HOURLY_RATE = "SavedHourlyRate"
     private val KEY_DAILY_REPORTS = "SavedDailyReportsData"
+    private val KEY_PAYOUTS = "SavedBiweeklyPayouts"
 
     // 接收懸浮窗廣播：取餐 / 送達
     private val floatingActionReceiver = object : BroadcastReceiver() {
@@ -113,6 +114,10 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     // 歷史每日報表集合 (Key: "yyyy-MM-dd")
     private val _dailyReports = MutableStateFlow<Map<String, DailyReport>>(emptyMap())
     val dailyReports: StateFlow<Map<String, DailyReport>> = _dailyReports.asStateFlow()
+
+    // 每個雙週期的 Uber 實際入帳（Key: 該期起點的毫秒數）
+    private val _biweeklyPayouts = MutableStateFlow<Map<String, String>>(emptyMap())
+    val biweeklyPayouts: StateFlow<Map<String, String>> = _biweeklyPayouts.asStateFlow()
 
     // 歷史報表目前選取的日期 (預設今天)
     private val _selectedReportDate = MutableStateFlow(getTodayDateKey())
@@ -210,6 +215,13 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
             }
         }
 
+        prefs.getString(KEY_PAYOUTS, null)?.let { s ->
+            try {
+                _biweeklyPayouts.value = json.decodeFromString<Map<String, String>>(s)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
         val reportsJson = prefs.getString(KEY_DAILY_REPORTS, null)
         if (!reportsJson.isNullOrEmpty()) {
             try {
@@ -953,6 +965,32 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         saveData()
     }
 
+    /** 記下 Uber 那邊顯示的開始時間與歷時（用來比對、補足時間） */
+    fun updateBatchUberCompare(
+        dateKey: String,
+        batchId: String,
+        startHour: String,
+        startMinute: String,
+        durHours: String,
+        durMinutes: String,
+        durSeconds: String
+    ) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: return
+        reports[dateKey] = report.copy(
+            batches = report.batches.map { b ->
+                if (b.id != batchId) b else b.copy(
+                    uberStartTimeHour = startHour,
+                    uberStartTimeMinute = startMinute,
+                    uberDurationHours = durHours,
+                    uberDurationMinutes = durMinutes,
+                    uberDurationSeconds = durSeconds
+                )
+            }
+        )
+        _dailyReports.value = reports
+        saveData()
+    }
     /** 刪掉日報裡某一張歷史單；那一批如果空了，整批一起拿掉 */
     fun deleteHistoryOrder(dateKey: String, batchId: String, orderId: String) {
         val reports = _dailyReports.value.toMutableMap()
@@ -969,6 +1007,75 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         saveData()
     }
 
+    /** 記下某一個雙週期 Uber 整期實際入帳金額 */
+    fun updateBiweeklyPayout(cycleKey: String, amount: String) {
+        _biweeklyPayouts.value = _biweeklyPayouts.value + (cycleKey to amount)
+        prefs.edit()
+            .putString(KEY_PAYOUTS, json.encodeToString(_biweeklyPayouts.value))
+            .apply()
+    }
+    /** 記下某一天的備註 */
+    fun updateDailyNote(dateKey: String, note: String) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: DailyReport(dateString = dateKey)
+        reports[dateKey] = report.copy(dailyNote = note)
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /** 把一行 CSV 拆成欄位（引號裡的逗號不當分隔） */
+    private fun splitCsvLine(line: String): List<String> {
+        val out = mutableListOf<String>()
+        val sb = StringBuilder()
+        var inQuote = false
+        for (c in line) {
+            when {
+                c == '"' -> inQuote = !inQuote
+                c == ',' && !inQuote -> { out.add(sb.toString()); sb.clear() }
+                else -> sb.append(c)
+            }
+        }
+        out.add(sb.toString())
+        return out
+    }
+
+    /** 匯入 Uber 收入明細 CSV，把每天的總額填進「Uber 實發」；回傳更新了幾天 */
+    fun importUberCSV(csv: String): Int {
+        val formats = listOf(
+            "yyyy/MM/dd hh:mm a",
+            "yyyy/MM/dd HH:mm",
+            "yyyy/MM/dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm",
+            "yyyy-MM-dd HH:mm:ss"
+        ).map { SimpleDateFormat(it, Locale.US).apply { isLenient = false } }
+        val keyFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+
+        val dailyTotals = mutableMapOf<String, Double>()
+        for (line in csv.removePrefix("\uFEFF").lines().drop(1)) {
+            val cols = splitCsvLine(line)
+            if (cols.size < 6) continue
+            val rawDate = cols[0].trim()
+                .replace("上午", "AM").replace("下午", "PM")
+            if (rawDate.lowercase().contains("total")) continue
+            val amount = cols[5].trim()
+                .replace("$", "").replace(",", "").toDoubleOrNull() ?: continue
+            val date = formats.firstNotNullOfOrNull { f ->
+                runCatching { f.parse(rawDate) }.getOrNull()
+            } ?: continue
+            val key = keyFmt.format(date)
+            dailyTotals[key] = (dailyTotals[key] ?: 0.0) + amount
+        }
+
+        if (dailyTotals.isEmpty()) return 0
+        val reports = _dailyReports.value.toMutableMap()
+        for ((key, total) in dailyTotals) {
+            val r = reports[key] ?: DailyReport(dateString = key)
+            reports[key] = r.copy(dailyUberActualPayout = "%.1f".format(Locale.US, total))
+        }
+        _dailyReports.value = reports
+        saveData()
+        return dailyTotals.size
+    }
     /** 更新熊貓實際入帳金額 */
     fun updatePandaActualPayout(dateKey: String, amount: String) {
         val reports = _dailyReports.value.toMutableMap()
@@ -1042,7 +1149,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     /**
      * 將所有歷史報表匯出成標準 CSV 格式字串 (對應 iOS: exportToCSV)
      */
-    fun exportReportsToCSV(): String {
+    fun exportReportsToCSVOld(): String {
         val sb = StringBuilder()
         sb.append("日期,批次號,訂單號,開始時間,送達時間,狀態,實收工資,小費,平台單號備註\n")
         val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
@@ -1065,6 +1172,85 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         return sb.toString()
     }
 
+    // ───────── CSV 匯出／匯入（格式跟 iPhone 相同） ─────────
+
+    private fun isoFormat() = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+        timeZone = java.util.TimeZone.getTimeZone("UTC")
+    }
+
+    /** 匯出全部日報成 CSV 文字（跟 iPhone 版同欄位） */
+    fun exportReportsToCSV(): String {
+        val sb = StringBuilder("Date,BatchNumber,OrderNumber,StartTime,EndTime,IsDiscarded,CustomWage,Tip\n")
+        val iso = isoFormat()
+        for ((dateKey, report) in _dailyReports.value.toSortedMap()) {
+            for (batch in report.batches) {
+                for (order in batch.orders) {
+                    val s = iso.format(Date(order.startTimeMillis))
+                    val e = order.endTimeMillis?.let { iso.format(Date(it)) } ?: ""
+                    val wage = order.customWageInput.replace(",", "")
+                    val tip = order.tipInput.replace(",", "")
+                    sb.append("$dateKey,${batch.batchNumber},${order.orderNumber},$s,$e,${order.isDiscarded},$wage,$tip\n")
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    /** 匯入 CSV，把單子追加進日報；回傳新增了幾張單 */
+    fun importFromCSV(csv: String): Int {
+        val iso = isoFormat()
+        val reports = _dailyReports.value.toMutableMap()
+        var added = 0
+        for (line in csv.removePrefix("\uFEFF").lines().drop(1)) {
+            val cols = line.split(",")
+            if (cols.size < 8) continue
+            val dateKey = cols[0].trim().replace("\"", "")
+            if (dateKey.isEmpty()) continue
+            val batchNum = cols[1].trim().toIntOrNull() ?: continue
+            val orderNum = cols[2].trim().toIntOrNull() ?: continue
+            val start = runCatching { iso.parse(cols[3].trim())!!.time }.getOrNull() ?: continue
+            val end = cols[4].trim().takeIf { it.isNotEmpty() }
+                ?.let { runCatching { iso.parse(it)!!.time }.getOrNull() }
+            val discarded = cols[5].trim().equals("true", ignoreCase = true)
+            val wage = cols[6].trim()
+            val tip = cols[7].trim()
+
+            val report = reports[dateKey] ?: DailyReport(dateString = dateKey)
+            // 同一天已經有開始、結束時間一模一樣的單，就不重複加
+            if (report.batches.any { b ->
+                    b.orders.any { it.startTimeMillis == start && it.endTimeMillis == end }
+                }) continue
+
+            val idx = report.batches.indexOfFirst { it.batchNumber == batchNum }
+            val newBatches = if (idx >= 0) {
+                val b = report.batches[idx]
+                val maxNum = b.orders.maxOfOrNull { it.orderNumber } ?: 0
+                val num = if (b.orders.any { it.orderNumber == orderNum }) maxNum + 1 else orderNum
+                val o = DeliveryOrder(
+                    orderNumber = num, startTimeMillis = start, endTimeMillis = end,
+                    isCompleted = true, isDiscarded = discarded,
+                    customWageInput = wage, tipInput = tip
+                )
+                report.batches.toMutableList().also { it[idx] = b.copy(orders = b.orders + o) }
+            } else {
+                val o = DeliveryOrder(
+                    orderNumber = orderNum, startTimeMillis = start, endTimeMillis = end,
+                    isCompleted = true, isDiscarded = discarded,
+                    customWageInput = wage, tipInput = tip
+                )
+                report.batches + DeliveryBatch(
+                    batchNumber = batchNum, orders = listOf(o), createdAtMillis = start
+                )
+            }
+            reports[dateKey] = report.copy(batches = newBatches)
+            added++
+        }
+        if (added > 0) {
+            _dailyReports.value = reports
+            saveData()
+        }
+        return added
+    }
     fun getTodayDateKey(): String {
         val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
         return sdf.format(Date())
