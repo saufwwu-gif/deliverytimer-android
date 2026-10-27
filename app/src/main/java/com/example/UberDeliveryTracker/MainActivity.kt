@@ -25,6 +25,8 @@ import androidx.compose.ui.Modifier
 import com.example.UberDeliveryTracker.floating.FloatingTrackerService
 import com.example.UberDeliveryTracker.ocr.ScreenshotObserver
 import com.example.UberDeliveryTracker.ui.DailyReportsScreen
+import com.example.UberDeliveryTracker.ui.EfficiencyScreen
+import androidx.compose.material.icons.filled.Star
 import com.example.UberDeliveryTracker.ui.BiweeklyScreen
 import com.example.UberDeliveryTracker.ui.YearlyScreen
 import androidx.compose.material.icons.filled.Menu
@@ -161,6 +163,12 @@ class MainActivity : ComponentActivity() {
                                 icon = { Icon(Icons.Default.Info, contentDescription = null) },
                                 label = { Text("年報") }
                             )
+                            NavigationBarItem(
+                                selected = currentTab == 6,
+                                onClick = { currentTab = 6 },
+                                icon = { Icon(Icons.Default.Star, contentDescription = null) },
+                                label = { Text("分析") }
+                            )
                         }
                     }
                 ) { innerPadding ->
@@ -194,6 +202,12 @@ class MainActivity : ComponentActivity() {
                                 .padding(innerPadding)
                         )
                         5 -> YearlyScreen(
+                            viewModel = deliveryViewModel,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(innerPadding)
+                        )
+                        6 -> EfficiencyScreen(
                             viewModel = deliveryViewModel,
                             modifier = Modifier
                                 .fillMaxSize()

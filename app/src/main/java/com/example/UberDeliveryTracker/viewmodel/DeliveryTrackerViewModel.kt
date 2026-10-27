@@ -19,6 +19,8 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.example.UberDeliveryTracker.floating.FloatingTrackerService
 import com.example.UberDeliveryTracker.location.GPSLocationManager
 import com.example.UberDeliveryTracker.model.DailyReport
+import com.example.UberDeliveryTracker.model.AnomalyTag
+import com.example.UberDeliveryTracker.model.DayAttendanceStatus
 import com.example.UberDeliveryTracker.model.DeliveryBatch
 import com.example.UberDeliveryTracker.model.DeliveryOrder
 import com.example.UberDeliveryTracker.model.WageSettings
@@ -171,6 +173,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     // ───────── 計時提醒用的小格子（要放在 init 前面）─────────
     private val spokenMilestones = mutableSetOf<String>()
     private var lastTestSecond = -1L
+    private val reminderNotifIds = mutableListOf<Int>()
     private var speech: TextToSpeech? = null
     private var speechReady = false
 
@@ -293,7 +296,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
 
     private fun remind(title: String, body: String) {
         sendReminderNotification(title, body)
-        if (speechReady) speech?.speak(body, TextToSpeech.QUEUE_ADD, null, "remind")
+        if (speechReady) speech?.speak(body, TextToSpeech.QUEUE_FLUSH, null, "remind")
     }
 
     @android.annotation.SuppressLint("MissingPermission")
@@ -315,9 +318,22 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
                 .setContentIntent(pi)
                 .setAutoCancel(true)
                 .build()
-            NotificationManagerCompat.from(app)
-                .notify(2000 + (System.currentTimeMillis() % 100000).toInt(), n)
+            val nid = 2000 + (System.currentTimeMillis() % 100000).toInt()
+            reminderNotifIds.add(nid)
+            NotificationManagerCompat.from(app).notify(nid, n)
         }
+    }
+
+    /** 整趟結束時：把還沒說完的語音和掛著的提醒通知都清掉 */
+    private fun stopReminders() {
+        speech?.stop()
+        val app = getApplication<Application>()
+        reminderNotifIds.forEach {
+            runCatching { NotificationManagerCompat.from(app).cancel(it) }
+        }
+        reminderNotifIds.clear()
+        spokenMilestones.clear()
+        lastTestSecond = -1L
     }
 
     override fun onCleared() {
@@ -536,7 +552,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         if (isStart) {
             if (all.isNotEmpty()) finalizeBatch() // 上一趟先收進日報
             startNewBatch(1)
-            runCatching { GPSLocationManager.instance.startNewDeliverySession() }
+            // runCatching { GPSLocationManager.instance.startNewDeliverySession() }
         } else {
             addAddOnOrders(1)
         }
@@ -636,7 +652,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun startNewBatch(initialOrderCount: Int = 1) {
-        runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.startNewDeliverySession() }
+        // runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.startNewDeliverySession() }
         val now = System.currentTimeMillis()
         batchStartTimeMillis = now
         _lastFinalized.value = null
@@ -734,7 +750,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
             _activeOrders.value = current
             _isDelivering.value = true
             // 復原後軌跡也要繼續記錄（不清掉原本的點）
-            runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.startTracking() }
+            // runCatching { com.example.UberDeliveryTracker.location.GPSLocationManager.instance.startTracking() }
             if (timerJob == null || !timerJob!!.isActive) {
                 startTimer()
             }
@@ -880,6 +896,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         _elapsedSeconds.value = 0L
         _totalEarnings.value = 0.0
         _currentHourlyWage.value = 0.0
+        stopReminders()
         batchStartTimeMillis = 0L
 
         saveData()
@@ -1014,6 +1031,49 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
             .putString(KEY_PAYOUTS, json.encodeToString(_biweeklyPayouts.value))
             .apply()
     }
+    /** 設定某一天「白天班」的出勤狀態 */
+    fun updateDayShiftStatus(dateKey: String, status: DayAttendanceStatus) {
+        val reports = _dailyReports.value.toMutableMap()
+        val old = reports[dateKey]
+        // 這天本來沒紀錄、又選「正常」，就什麼都不用存（避免產生空的一天）
+        if (old == null && status == DayAttendanceStatus.NORMAL) return
+        val report = old ?: DailyReport(dateString = dateKey)
+        reports[dateKey] = report.copy(dayShiftStatus = status)
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /** 設定某一天「晚上班」的出勤狀態 */
+    fun updateNightShiftStatus(dateKey: String, status: DayAttendanceStatus) {
+        val reports = _dailyReports.value.toMutableMap()
+        val old = reports[dateKey]
+        if (old == null && status == DayAttendanceStatus.NORMAL) return
+        val report = old ?: DailyReport(dateString = dateKey)
+        reports[dateKey] = report.copy(nightShiftStatus = status)
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /** 異常標籤：點一下勾選，再點一下取消 */
+    fun toggleAnomalyTag(dateKey: String, tag: AnomalyTag) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: DailyReport(dateString = dateKey)
+        val tags = if (tag in report.anomalyTags) report.anomalyTags - tag
+        else report.anomalyTags + tag
+        reports[dateKey] = report.copy(anomalyTags = tags)
+        _dailyReports.value = reports
+        saveData()
+    }
+
+    /** 異常事件備註（例：颱風、路封） */
+    fun updateAnomalyNote(dateKey: String, note: String) {
+        val reports = _dailyReports.value.toMutableMap()
+        val report = reports[dateKey] ?: DailyReport(dateString = dateKey)
+        reports[dateKey] = report.copy(anomalyNote = note)
+        _dailyReports.value = reports
+        saveData()
+    }
+
     /** 記下某一天的備註 */
     fun updateDailyNote(dateKey: String, note: String) {
         val reports = _dailyReports.value.toMutableMap()
@@ -1110,7 +1170,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         _isDelivering.value = restored.any { !it.isCompleted }
         _lastFinalized.value = null
         _lastRestore.value = null
-        runCatching { GPSLocationManager.instance.startTracking() }
+        // runCatching { GPSLocationManager.instance.startTracking() }
         startTimer()
         recalculateStats()
         saveData()

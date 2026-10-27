@@ -24,6 +24,11 @@ import com.example.UberDeliveryTracker.model.BiweeklyCalc
 import com.example.UberDeliveryTracker.model.DailyReport
 import com.example.UberDeliveryTracker.model.DeliveryBatch
 import com.example.UberDeliveryTracker.model.DeliveryOrder
+import com.example.UberDeliveryTracker.model.OverlapBaseline
+import com.example.UberDeliveryTracker.model.overallOverlapRate
+import com.example.UberDeliveryTracker.model.totalDepartureMinutes
+import com.example.UberDeliveryTracker.model.AnomalyTag
+import com.example.UberDeliveryTracker.model.DayAttendanceStatus
 import com.example.UberDeliveryTracker.viewmodel.DeliveryTrackerViewModel
 import java.text.SimpleDateFormat
 import java.util.*
@@ -41,6 +46,9 @@ fun DailyReportsScreen(
     var showManualOrderDialog by remember { mutableStateOf(false) }
 
     val currentReport = dailyReports[selectedDateKey] ?: DailyReport(dateString = selectedDateKey)
+    val overlapBaseline = remember(selectedDateKey, dailyReports) {
+        OverlapBaseline.preciseOverallBaseline(dailyReports, selectedDateKey)
+    }
 
     Scaffold(
         topBar = {
@@ -102,6 +110,17 @@ fun DailyReportsScreen(
             DailySummaryCard(
                 report = currentReport,
                 onUberActualChange = { viewModel.updateUberActualPayout(selectedDateKey, it) }
+            )
+
+            // 2.2 累計工時、出門時間、疊單率
+            OverlapInfoCard(report = currentReport, baseline = overlapBaseline)
+            // 2.3 每日出勤狀態（白天、晚上分開設定）
+            AttendanceCard(
+                report = currentReport,
+                onDayChange = { viewModel.updateDayShiftStatus(selectedDateKey, it) },
+                onNightChange = { viewModel.updateNightShiftStatus(selectedDateKey, it) },
+                onToggleTag = { viewModel.toggleAnomalyTag(selectedDateKey, it) },
+                onNoteChange = { viewModel.updateAnomalyNote(selectedDateKey, it) }
             )
 
             // 2.5 每日備註
@@ -473,6 +492,176 @@ fun ManualOrderDialog(
         }
     )
 }
+// ───────────────────────── 疊單率小卡 ─────────────────────────
+
+@Composable
+fun OverlapInfoCard(report: DailyReport, baseline: Double?) {
+    val rate = report.overallOverlapRate
+    val rateColor = when {
+        rate == null || baseline == null -> Color(0xFF7B1FA2)
+        rate >= baseline -> Color(0xFF2E7D32)
+        else -> Color.Red
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "累計工時 ${report.totalSummedMinutes.toInt()} 分",
+                    fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1976D2)
+                )
+                Text(
+                    "騎乘 ${report.totalActualRidingMinutes.toInt()} 分",
+                    fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFF9800)
+                )
+                Text(
+                    "出門 ${report.totalDepartureMinutes.toInt()} 分",
+                    fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF00ACC1)
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "疊單率 " + (rate?.let { "%.2f".format(it) } ?: "-"),
+                    fontSize = 14.sp, fontWeight = FontWeight.Bold, color = rateColor
+                )
+                Text(
+                    "過去8週基準(同星期幾) " + (baseline?.let { "%.2f".format(it) } ?: "-"),
+                    fontSize = 10.sp, color = Color.Gray
+                )
+            }
+        }
+    }
+}
+
+// ───────────────────────── 每日出勤狀態小卡 ─────────────────────────
+
+@Composable
+private fun ChoiceChip(
+    text: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .background(
+                if (selected) Color(0xFF1976D2) else Color.LightGray.copy(alpha = 0.3f),
+                RoundedCornerShape(8.dp)
+            )
+            .clickable { onClick() }
+            .padding(vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (selected) Color.White else Color.DarkGray
+        )
+    }
+}
+
+@Composable
+fun AttendanceCard(
+    report: DailyReport,
+    onDayChange: (DayAttendanceStatus) -> Unit,
+    onNightChange: (DayAttendanceStatus) -> Unit,
+    onToggleTag: (AnomalyTag) -> Unit,
+    onNoteChange: (String) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val hasAnomaly = report.dayShiftStatus == DayAttendanceStatus.ANOMALY ||
+            report.nightShiftStatus == DayAttendanceStatus.ANOMALY
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded },
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "出勤  白天:${report.dayShiftStatus.label}　晚上:${report.nightShiftStatus.label}",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(if (expanded) "▲" else "▼", fontSize = 12.sp, color = Color.Gray)
+            }
+
+            if (expanded) {
+                Text("🌞 白天班", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1976D2))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DayAttendanceStatus.values().forEach { s ->
+                        ChoiceChip(
+                            text = s.label,
+                            selected = report.dayShiftStatus == s,
+                            modifier = Modifier.weight(1f)
+                        ) { onDayChange(s) }
+                    }
+                }
+
+                Text("🌙 晚上班", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFF9800))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DayAttendanceStatus.values().forEach { s ->
+                        ChoiceChip(
+                            text = s.label,
+                            selected = report.nightShiftStatus == s,
+                            modifier = Modifier.weight(1f)
+                        ) { onNightChange(s) }
+                    }
+                }
+
+                if (hasAnomaly) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        AnomalyTag.values().forEach { t ->
+                            ChoiceChip(
+                                text = t.label,
+                                selected = t in report.anomalyTags,
+                                modifier = Modifier.weight(1f)
+                            ) { onToggleTag(t) }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = report.anomalyNote,
+                        onValueChange = onNoteChange,
+                        label = { Text("異常事件備註（例：颱風、路封）", fontSize = 11.sp) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                Text(
+                    "標「休假」的那一班，不列入任何平均和基準；標「異常」照樣算金額，但會附上標籤和備註。",
+                    fontSize = 10.sp,
+                    color = Color.Gray
+                )
+            }
+        }
+    }
+}
+
 // ───────────────────────── 歷史單修改視窗 ─────────────────────────
 
 @Composable

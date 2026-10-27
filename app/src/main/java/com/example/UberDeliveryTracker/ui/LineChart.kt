@@ -34,7 +34,8 @@ data class ChartSeries(
 /** 一條橫的參考虛線（例如旺季門檻 1.4） */
 data class ChartRule(
     val value: Double,
-    val color: Color
+    val color: Color,
+    val label: String = ""
 )
 
 /**
@@ -165,6 +166,10 @@ fun SimpleLineChart(
         }
 
         // 圖例
+        rules.filter { it.label.isNotEmpty() }.forEach { r ->
+            Text("┄ ${r.label}", fontSize = 11.sp, color = r.color)
+        }
+
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             series.forEach { s ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
