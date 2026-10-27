@@ -91,76 +91,82 @@ fun DailyReportsScreen(
             }
         }
     ) { innerPadding ->
-        Column(
+        LazyColumn(
             modifier = modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .padding(16.dp),
+                .padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(top = 16.dp, bottom = 88.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             // 0. 雙週結算卡（點一下展開）
-            BiweeklySummaryCard(viewModel = viewModel, selectedDateKey = selectedDateKey)
+            item {
+                BiweeklySummaryCard(viewModel = viewModel, selectedDateKey = selectedDateKey)
+            }
             // 1. 日期快速導航列
-            DateNavigationBar(
-                currentDateKey = selectedDateKey,
-                onDateSelected = { viewModel.selectReportDate(it) }
-            )
-
+            item {
+                DateNavigationBar(
+                    currentDateKey = selectedDateKey,
+                    onDateSelected = { viewModel.selectReportDate(it) }
+                )
+            }
             // 2. 當日彙總與對帳卡片
-            DailySummaryCard(
-                report = currentReport,
-                onUberActualChange = { viewModel.updateUberActualPayout(selectedDateKey, it) }
-            )
-
+            item {
+                DailySummaryCard(
+                    report = currentReport,
+                    onUberActualChange = { viewModel.updateUberActualPayout(selectedDateKey, it) }
+                )
+            }
             // 2.2 累計工時、出門時間、疊單率
-            OverlapInfoCard(report = currentReport, baseline = overlapBaseline)
+            item {
+                OverlapInfoCard(report = currentReport, baseline = overlapBaseline)
+            }
             // 2.3 每日出勤狀態（白天、晚上分開設定）
-            AttendanceCard(
-                report = currentReport,
-                onDayChange = { viewModel.updateDayShiftStatus(selectedDateKey, it) },
-                onNightChange = { viewModel.updateNightShiftStatus(selectedDateKey, it) },
-                onToggleTag = { viewModel.toggleAnomalyTag(selectedDateKey, it) },
-                onNoteChange = { viewModel.updateAnomalyNote(selectedDateKey, it) }
-            )
-
+            item {
+                AttendanceCard(
+                    report = currentReport,
+                    onDayChange = { viewModel.updateDayShiftStatus(selectedDateKey, it) },
+                    onNightChange = { viewModel.updateNightShiftStatus(selectedDateKey, it) },
+                    onToggleTag = { viewModel.toggleAnomalyTag(selectedDateKey, it) },
+                    onNoteChange = { viewModel.updateAnomalyNote(selectedDateKey, it) }
+                )
+            }
             // 2.5 每日備註
-            OutlinedTextField(
-                value = currentReport.dailyNote,
-                onValueChange = { viewModel.updateDailyNote(selectedDateKey, it) },
-                label = { Text("📝 今日備註（例：下雨、提早收工）", fontSize = 11.sp) },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
-            )
+            item {
+                OutlinedTextField(
+                    value = currentReport.dailyNote,
+                    onValueChange = { viewModel.updateDailyNote(selectedDateKey, it) },
+                    label = { Text("📝 今日備註（例：下雨、提早收工）", fontSize = 11.sp) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
             // 3. 批次與訂單清單
-            Text(
-                text = "跑單批次明細 (${currentReport.batches.size} 批 / 共 ${currentReport.totalOrdersCount} 單)",
-                fontWeight = FontWeight.Bold,
-                fontSize = 15.sp
-            )
-
+            item {
+                Text(
+                    text = "跑單批次明細 (${currentReport.batches.size} 批 / 共 ${currentReport.totalOrdersCount} 單)",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp
+                )
+            }
             if (currentReport.batches.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "此日無跑單紀錄\n可點擊右下角「手動補單」新增歷史訂單",
-                        color = Color.Gray,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                    )
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "此日無跑單紀錄\n可點擊右下角「手動補單」新增歷史訂單",
+                            color = Color.Gray,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
                 }
             } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    items(currentReport.batches, key = { it.id }) { batch ->
-                        BatchCard(batch = batch, dateKey = selectedDateKey, viewModel = viewModel)
-                    }
+                items(currentReport.batches, key = { it.id }) { batch ->
+                    BatchCard(batch = batch, dateKey = selectedDateKey, viewModel = viewModel)
                 }
             }
         }
