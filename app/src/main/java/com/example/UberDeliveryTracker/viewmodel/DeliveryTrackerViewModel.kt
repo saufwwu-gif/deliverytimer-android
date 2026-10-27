@@ -61,7 +61,9 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
                         isOffer = intent?.getBooleanExtra(FloatingTrackerService.EXTRA_IS_OFFER, false) ?: false,
                         isCash = intent?.getBooleanExtra(FloatingTrackerService.EXTRA_IS_CASH, false) ?: false,
                         offerSummary = intent?.getStringExtra(FloatingTrackerService.EXTRA_OFFER_SUMMARY) ?: "",
-                        cashAmount = intent?.getDoubleExtra(FloatingTrackerService.EXTRA_CASH_AMOUNT, -1.0) ?: -1.0
+                        cashAmount = intent?.getDoubleExtra(FloatingTrackerService.EXTRA_CASH_AMOUNT, -1.0) ?: -1.0,
+                        isAuto = intent?.getBooleanExtra(FloatingTrackerService.EXTRA_IS_AUTO, false) ?: false
+
                     )
                 }
                 FloatingTrackerService.ACTION_PICKUP_ORDER -> {
@@ -176,9 +178,21 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     private val reminderNotifIds = mutableListOf<Int>()
     private var speech: TextToSpeech? = null
     private var speechReady = false
+    // 上一次「開始計時」的時間與來源（自動 or 截圖），避免同一張來單被開兩次
+    private var lastOfferStartMillis = 0L
+    private var lastOfferStartByAuto = false
 
     private val _testMode = MutableStateFlow(false)
     val testMode: StateFlow<Boolean> = _testMode.asStateFlow()
+    // 無障礙「自動帶入」開關（截圖助手也會讀同一個值）
+    private val _autoFill = MutableStateFlow(prefs.getBoolean("AutoFillEnabled", true))
+    val autoFill: StateFlow<Boolean> = _autoFill.asStateFlow()
+
+    fun setAutoFill(on: Boolean) {
+        _autoFill.value = on
+        prefs.edit().putBoolean("AutoFillEnabled", on).apply()
+    }
+
 
     init {
         loadSavedData()
@@ -560,10 +574,11 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
     }
 
     /**
-     * 懸浮窗偵測到截圖：
-     * 1) 新來單 → 一定是新的一張單，開始計時 / 加單，現金單會提醒
+     * 偵測到截圖，或無障礙自動讀到畫面：
+     * 1) 新來單 → 一定是新的一張單，開始計時 / 加單，現金單會標記並提醒
      * 2) 單號畫面 → 補給最早那張還沒單號的單
-     * 3) 什麼都沒辨識到 → 還是當作接單，照樣計時
+     * 3) 自動模式讀到單號但沒有空白的單 → 什麼都不做（不亂開新單）
+     * 4) 手動截圖什麼都沒辨識到 → 還是當作接單，照樣計時
      */
     private fun handleScreenshotFromFloating(
         noteText: String,
@@ -571,11 +586,13 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         isOffer: Boolean = false,
         isCash: Boolean = false,
         offerSummary: String = "",
-        cashAmount: Double = -1.0
+        cashAmount: Double = -1.0,
+        isAuto: Boolean = false
     ) {
         val all = _activeOrders.value
         val open = all.filter { !it.isCompleted && !it.isDiscarded }
         val oneLine = noteText.replace("\n", " ")
+        val tag = if (isAuto) "🤖 " else ""
 
         // 0) 收取費用畫面：把金額填進現金單
         if (cashAmount > 0) {
@@ -585,11 +602,26 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
 
         // 1) 新來單
         if (isOffer) {
+            val nowMs = System.currentTimeMillis()
+            // 截圖和自動在 20 秒內抓到同一張來單 → 只算一次
+            if (lastOfferStartMillis > 0L &&
+                isAuto != lastOfferStartByAuto &&
+                nowMs - lastOfferStartMillis < 20_000L
+            ) {
+                return
+            }
+            lastOfferStartMillis = nowMs
+            lastOfferStartByAuto = isAuto
+
             val (isStart, newOrder) = startOrAddOne()
+            // 現金單：直接幫新單標上「現金單」，之後讀到金額會優先填給它
+            if (isCash && newOrder != null && !newOrder.isCashOrder) {
+                toggleCashOrder(newOrder.id)
+            }
             val head = if (isStart) "⏱ 已開始計時" else "➕ 已加一單"
             val info = if (offerSummary.isNotEmpty()) "（$offerSummary）" else ""
             val cashTip = if (isCash) "\n💵 這是現金單！記得跟客人收錢" else ""
-            sendMessageToFloating("$head 訂單 #${newOrder?.orderNumber ?: 1}$info$cashTip")
+            sendMessageToFloating("$tag$head 訂單 #${newOrder?.orderNumber ?: 1}$info$cashTip")
             return
         }
 
@@ -597,7 +629,7 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         if (orderCode.isNotEmpty() &&
             all.any { !it.isDiscarded && it.userNote.contains(orderCode, ignoreCase = true) }
         ) {
-            sendMessageToFloating("單號 $orderCode 已經在訂單裡了，沒有重複新增")
+            if (!isAuto) sendMessageToFloating("單號 $orderCode 已經在訂單裡了，沒有重複新增")
             return
         }
 
@@ -605,11 +637,19 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         val emptyOrder = open.sortedBy { it.startTimeMillis }.firstOrNull { it.userNote.trim().isEmpty() }
         if (noteText.isNotEmpty() && emptyOrder != null) {
             updateOrderNote(emptyOrder.id, noteText)
-            sendMessageToFloating("✅ 單號填入訂單 #${emptyOrder.orderNumber}：$oneLine")
+            sendMessageToFloating("$tag✅ 單號填入訂單 #${emptyOrder.orderNumber}：$oneLine")
             return
         }
 
-        // 4) 其他情況：這張截圖就是「接了一張新單」
+        // 3.5) 自動模式：沒有空白的單可以填，就不要亂開新單
+        if (isAuto) {
+            if (noteText.isNotEmpty()) {
+                sendMessageToFloating("🤖 讀到單號 $oneLine，但沒有空白的單可以填，沒有動作")
+            }
+            return
+        }
+
+        // 4) 手動截圖的其他情況：這張截圖就是「接了一張新單」
         val (isStart, newOrder) = startOrAddOne()
         if (newOrder != null && noteText.isNotEmpty()) updateOrderNote(newOrder.id, noteText)
 

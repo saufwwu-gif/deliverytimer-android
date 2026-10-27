@@ -53,6 +53,7 @@ fun DeliveryTrackerScreen(
     val shift by viewModel.shift.collectAsState()
     val lastFinalized by viewModel.lastFinalized.collectAsState()
     val testMode by viewModel.testMode.collectAsState()
+    val autoFill by viewModel.autoFill.collectAsState()
     var showEstimatorDialog by remember { mutableStateOf(false) }
     var summaryExpanded by remember { mutableStateOf(false) }
     var actionsVisible by remember { mutableStateOf(true) }
@@ -186,6 +187,13 @@ fun DeliveryTrackerScreen(
             ) {
                 Text("🔔 5 秒測試提醒（測試用）", fontSize = 12.sp, modifier = Modifier.weight(1f))
                 Switch(checked = testMode, onCheckedChange = { viewModel.setTestMode(it) })
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("🤖 無障礙自動帶入（接受→計時、單號、現金）", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                Switch(checked = autoFill, onCheckedChange = { viewModel.setAutoFill(it) })
             }
         }
 
