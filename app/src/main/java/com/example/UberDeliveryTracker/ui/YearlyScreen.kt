@@ -22,6 +22,8 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
 
 /** 一個月的統計 */
 private data class MonthRow(
@@ -39,6 +41,7 @@ private data class MonthRow(
 @Composable
 fun YearlyScreen(
     viewModel: DeliveryTrackerViewModel,
+    onSaveRangeCsv: (String, String, () -> Unit) -> Unit = { _, _, _ -> },
     modifier: Modifier = Modifier
 ) {
     val reports by viewModel.dailyReports.collectAsState()
@@ -76,6 +79,76 @@ fun YearlyScreen(
     val totalUber = rows.sumOf { it.uber }
     val totalPanda = rows.sumOf { it.panda }
     val totalDiff = totalUber + totalPanda - totalEst
+
+    // ───────── 匯出並瘦身 ─────────
+    val context = LocalContext.current
+    var menuOpen by remember { mutableStateOf(false) }
+    var step by remember { mutableStateOf(0) } // 0 沒事、1 說明、2 問要不要刪
+    var rangeTitle by remember { mutableStateOf("") }
+    var startM by remember { mutableStateOf(1) }
+    var endM by remember { mutableStateOf(1) }
+    val ranges = remember {
+        (1..12).map { Triple("${it}月", it, it) } + listOf(
+            Triple("Q1", 1, 3), Triple("Q2", 4, 6), Triple("Q3", 7, 9), Triple("Q4", 10, 12),
+            Triple("上半年", 1, 6), Triple("下半年", 7, 12), Triple("全年", 1, 12)
+        )
+    }
+
+    if (step == 1) {
+        val (dayCount, orderCount) = viewModel.rangeSummary(year, startM, endM)
+        if (orderCount == 0) {
+            AlertDialog(
+                onDismissRequest = { step = 0 },
+                title = { Text("沒有單可以匯出") },
+                text = { Text("$year 年 $rangeTitle 沒有任何單（今天的單不算），不用瘦身。") },
+                confirmButton = { TextButton(onClick = { step = 0 }) { Text("知道了") } }
+            )
+        } else {
+            AlertDialog(
+                onDismissRequest = { step = 0 },
+                title = { Text("匯出 $year 年 $rangeTitle 並瘦身？") },
+                text = {
+                    Text(
+                        "這段期間有 $dayCount 天、$orderCount 張單。\n\n" +
+                        "第一步先把單存成備份檔。存好之後，我會再問你一次要不要刪。\n\n" +
+                        "⚠️ 備份檔只記得：日期、開始與結束時間、棄單、自訂金額、小費。\n" +
+                        "下面這些不在備份檔裡，刪掉就找不回來：\n" +
+                        "・平台單號\n・手動修正的工時\n・Uber 對比時間\n・現金單標記\n" +
+                        "・Uber／熊貓實發金額、每日備註、出勤狀態\n\n" +
+                        "刪掉之後，那段期間的疊單率圖與好跑日基準也會跟著少掉。\n" +
+                        "今天的單不會被匯出，也不會被刪。"
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val csv = viewModel.exportRangeToCSV(year, startM, endM)
+                        onSaveRangeCsv(csv, "${year}_${rangeTitle}_備份.csv") { step = 2 }
+                    }) { Text("我了解，先匯出備份") }
+                },
+                dismissButton = { TextButton(onClick = { step = 0 }) { Text("取消") } }
+            )
+        }
+    }
+    if (step == 2) {
+        AlertDialog(
+            onDismissRequest = { step = 0 },
+            title = { Text("備份已存好，要刪掉嗎？") },
+            text = {
+                Text(
+                    "建議先到檔案管理確認備份檔真的在，再按刪除。\n" +
+                    "刪掉後無法復原，只能靠匯入備份檔把單補回來（上一個畫面列的那些東西補不回來）。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val n = viewModel.purgeRange(year, startM, endM)
+                    step = 0
+                    Toast.makeText(context, "已刪除 $n 天的紀錄", Toast.LENGTH_LONG).show()
+                }) { Text("確定刪除", color = Color.Red) }
+            },
+            dismissButton = { TextButton(onClick = { step = 0 }) { Text("先不刪") } }
+        )
+    }
 
     LazyColumn(
         modifier = modifier
@@ -153,6 +226,45 @@ fun YearlyScreen(
                         (if (totalDiff >= 0) "+\$" else "-\$") + "%.0f".format(kotlin.math.abs(totalDiff)),
                         if (totalDiff >= 0) Color(0xFF2E7D32) else Color.Red
                     )
+                }
+            }
+        }
+
+        // 備份與瘦身
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFF9800).copy(alpha = 0.10f))
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("📦 資料備份與瘦身", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(
+                        "先把單存成備份檔，確認存好之後，才會問你要不要從 App 裡刪掉，讓 App 變輕。",
+                        fontSize = 11.sp, color = Color.Gray
+                    )
+                    Box {
+                        Button(onClick = { menuOpen = true }, modifier = Modifier.fillMaxWidth()) {
+                            Text("選擇 $year 年要匯出的區間")
+                        }
+                        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            ranges.forEach { (t, s, e) ->
+                                DropdownMenuItem(
+                                    text = { Text(t) },
+                                    onClick = {
+                                        menuOpen = false
+                                        rangeTitle = t
+                                        startM = s
+                                        endM = e
+                                        step = 1
+                                    }
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -1311,6 +1311,58 @@ class DeliveryTrackerViewModel(application: Application) : AndroidViewModel(appl
         }
         return added
     }
+    // ───────── 年報：匯出並瘦身 ─────────
+
+    /** 某年某幾個月裡「有單的日子」（今天不算） */
+    private fun keysWithOrders(year: Int, startMonth: Int, endMonth: Int): List<String> {
+        val today = getTodayDateKey()
+        return _dailyReports.value.filter { (key, report) ->
+            val y = key.take(4).toIntOrNull()
+            val m = key.drop(5).take(2).toIntOrNull()
+            key != today && y == year && m != null && m in startMonth..endMonth &&
+                    report.batches.any { it.orders.isNotEmpty() }
+        }.keys.sorted()
+    }
+
+    /** 這段期間有幾天、幾張單（天數, 單數） */
+    fun rangeSummary(year: Int, startMonth: Int, endMonth: Int): Pair<Int, Int> {
+        val keys = keysWithOrders(year, startMonth, endMonth)
+        val orders = keys.sumOf { k ->
+            _dailyReports.value[k]?.batches?.sumOf { it.orders.size } ?: 0
+        }
+        return Pair(keys.size, orders)
+    }
+
+    /** 把這段期間的單匯出成 CSV 文字（格式跟整份備份一樣） */
+    fun exportRangeToCSV(year: Int, startMonth: Int, endMonth: Int): String {
+        val sb = StringBuilder("Date,BatchNumber,OrderNumber,StartTime,EndTime,IsDiscarded,CustomWage,Tip\n")
+        val iso = isoFormat()
+        for (dateKey in keysWithOrders(year, startMonth, endMonth)) {
+            val report = _dailyReports.value[dateKey] ?: continue
+            for (batch in report.batches) {
+                for (order in batch.orders) {
+                    val s = iso.format(Date(order.startTimeMillis))
+                    val e = order.endTimeMillis?.let { iso.format(Date(it)) } ?: ""
+                    val wage = order.customWageInput.replace(",", "")
+                    val tip = order.tipInput.replace(",", "")
+                    sb.append("$dateKey,${batch.batchNumber},${order.orderNumber},$s,$e,${order.isDiscarded},$wage,$tip\n")
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    /** 刪掉這段期間「有單的日子」；回傳刪了幾天 */
+    fun purgeRange(year: Int, startMonth: Int, endMonth: Int): Int {
+        val keys = keysWithOrders(year, startMonth, endMonth)
+        if (keys.isEmpty()) return 0
+        val reports = _dailyReports.value.toMutableMap()
+        keys.forEach { reports.remove(it) }
+        _dailyReports.value = reports
+        saveData()
+        return keys.size
+    }
+
     fun getTodayDateKey(): String {
         val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
         return sdf.format(Date())

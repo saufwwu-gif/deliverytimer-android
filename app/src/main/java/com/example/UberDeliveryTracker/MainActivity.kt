@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
 
     // 匯出 CSV：跳出「存到哪裡」的畫面
     private var pendingCsv: String = ""
+    private var pendingOnSaved: (() -> Unit)? = null
     private val csvExportLauncher = registerForActivityResult(
         ActivityResultContracts.CreateDocument("text/csv")
     ) { uri ->
@@ -69,6 +70,8 @@ class MainActivity : ComponentActivity() {
                 }
             }.isSuccess
             Toast.makeText(this, if (ok) "✅ 備份已存好" else "存檔失敗", Toast.LENGTH_LONG).show()
+            if (ok) pendingOnSaved?.invoke()
+            pendingOnSaved = null
         }
     }
 
@@ -99,10 +102,19 @@ class MainActivity : ComponentActivity() {
             return
         }
         pendingCsv = csvContent
+        pendingOnSaved = null
         val day = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
             .format(java.util.Date())
         csvExportLauncher.launch("DeliveryBackup_$day.csv")
     }
+
+    // 年報匯出並瘦身：存檔成功後才會呼叫 onSaved
+    private fun saveRangeCsv(csvContent: String, fileName: String, onSaved: () -> Unit) {
+        pendingCsv = csvContent
+        pendingOnSaved = onSaved
+        csvExportLauncher.launch(fileName)
+    }
+
     // 匯入 Uber 收入明細 CSV：跳出「選哪個檔案」的畫面
     private val uberCsvImportLauncher = registerForActivityResult(
         ActivityResultContracts.GetContent()
@@ -202,6 +214,7 @@ class MainActivity : ComponentActivity() {
                                 .padding(innerPadding)
                         )
                         5 -> YearlyScreen(
+                            onSaveRangeCsv = { csv, name, done -> saveRangeCsv(csv, name, done) },
                             viewModel = deliveryViewModel,
                             modifier = Modifier
                                 .fillMaxSize()
